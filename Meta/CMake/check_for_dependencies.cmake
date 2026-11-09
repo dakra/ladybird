@@ -76,6 +76,11 @@ find_package(SQLite3 REQUIRED)
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 
+# The Emacs headless mode compresses frames with zstd, and is not built on Windows.
+if (NOT WIN32)
+    find_package(zstd CONFIG REQUIRED)
+endif()
+
 pkg_check_modules(LIBPSL REQUIRED IMPORTED_TARGET libpsl)
 
 find_package(unofficial-angle CONFIG)

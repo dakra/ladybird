@@ -24,6 +24,7 @@ enum class HeadlessMode {
     Text,
     Manual,
     Terminal,
+    Emacs,
     Test,
 };
 
@@ -98,6 +99,8 @@ struct BrowserOptions {
     int window_width { 800 };
     int window_height { 600 };
     double device_pixel_ratio { 1.0 };
+    Optional<ByteString> emacs_socket_path {};
+    Optional<ByteString> emacs_log_path {};
     NewWindow new_window { NewWindow::No };
     AllowPopups allow_popups { AllowPopups::No };
     DisableScripting disable_scripting { DisableScripting::No };

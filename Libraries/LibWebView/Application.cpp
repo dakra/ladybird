@@ -88,6 +88,7 @@
 #include <LibWebView/WorkerAgentManager.h>
 
 #if !defined(AK_OS_WINDOWS)
+#    include <LibWebView/EmacsWebView.h>
 #    include <LibWebView/TerminalWebView.h>
 #endif
 
@@ -327,6 +328,8 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     Optional<int> window_width;
     Optional<int> window_height;
     Optional<double> device_pixel_ratio;
+    Optional<StringView> emacs_socket_path;
+    Optional<StringView> emacs_log_path;
     Optional<u32> screenshot_delay;
     Optional<StringView> screenshot_path;
     bool new_window = false;
@@ -390,7 +393,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
 
     args_parser.add_option(Core::ArgsParser::Option {
         .argument_mode = Core::ArgsParser::OptionArgumentMode::Optional,
-        .help_string = "Run Ladybird without a browser window. Mode may be 'screenshot' (default), 'layout-tree', 'text', 'manual', or 'terminal'.",
+        .help_string = "Run Ladybird without a browser window. Mode may be 'screenshot' (default), 'layout-tree', 'text', 'manual', 'terminal', or 'emacs'.",
         .long_name = "headless",
         .value_name = "mode",
         .accept_value = [&](StringView value) {
@@ -408,6 +411,8 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
 #if !defined(AK_OS_WINDOWS)
             else if (value.equals_ignoring_ascii_case("terminal"sv))
                 headless_mode = HeadlessMode::Terminal;
+            else if (value.equals_ignoring_ascii_case("emacs"sv))
+                headless_mode = HeadlessMode::Emacs;
 #endif
 
             return headless_mode.has_value();
@@ -419,6 +424,8 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(window_width, "Set viewport width in pixels (default: 800) (currently only supported for headless mode)", "window-width", 0, "pixels");
     args_parser.add_option(window_height, "Set viewport height in pixels (default: 600) (currently only supported for headless mode)", "window-height", 0, "pixels");
     args_parser.add_option(device_pixel_ratio, "Set the device pixel ratio (default: 1) (only supported for headless terminal mode)", "device-pixel-ratio", 0, "ratio");
+    args_parser.add_option(emacs_socket_path, "Serve the Emacs client on a Unix socket instead of stdio (only supported for headless emacs mode)", "emacs-socket", 0, "path");
+    args_parser.add_option(emacs_log_path, "Write log output to the given file (only supported for headless emacs mode)", "emacs-log", 0, "path");
     args_parser.add_option(certificates, "Path to a certificate file", "certificate", 'C', "certificate");
     args_parser.add_option(Core::ArgsParser::Option {
         .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
@@ -618,10 +625,16 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         m_browser_options.window_height = *window_height;
     if (device_pixel_ratio.has_value())
         m_browser_options.device_pixel_ratio = *device_pixel_ratio;
+    if (emacs_socket_path.has_value())
+        m_browser_options.emacs_socket_path = *emacs_socket_path;
+    if (emacs_log_path.has_value())
+        m_browser_options.emacs_log_path = *emacs_log_path;
 
 #if !defined(AK_OS_WINDOWS)
     if (headless_mode == HeadlessMode::Terminal)
         TRY(TerminalWebView::take_over_terminal());
+    if (headless_mode == HeadlessMode::Emacs)
+        TRY(EmacsTransport::take_over_stdio(m_browser_options.emacs_socket_path.has_value() ? EmacsTransport::Kind::Socket : EmacsTransport::Kind::Stdio, m_browser_options.emacs_log_path));
 #endif
 
     if (webdriver_browser_endpoint.has_value())
@@ -2572,6 +2585,12 @@ ErrorOr<int> Application::execute()
         auto theme = TRY(Gfx::load_system_theme(theme_path.string()));
 
 #if !defined(AK_OS_WINDOWS)
+        // The Emacs client creates the view, so the server also runs without a URL.
+        if (*m_browser_options.headless_mode == HeadlessMode::Emacs) {
+            auto emacs_server = TRY(EmacsServer::create(move(theme), m_browser_options));
+            return m_event_loop->exec();
+        }
+
         if (*m_browser_options.headless_mode == HeadlessMode::Terminal)
             view = TRY(TerminalWebView::create(move(theme), m_browser_options.device_pixel_ratio));
         else
@@ -2596,6 +2615,7 @@ ErrorOr<int> Application::execute()
             case HeadlessMode::Terminal:
                 load_page_and_exit_on_close(*m_event_loop, *view, m_browser_options.urls.first());
                 break;
+            case HeadlessMode::Emacs:
             case HeadlessMode::Test:
                 VERIFY_NOT_REACHED();
             }
@@ -2744,6 +2764,14 @@ static LexicalPath unique_download_path(ByteString const& downloads_directory, B
 
 ErrorOr<LexicalPath> Application::default_path_for_downloaded_file(ByteString const& file) const
 {
+#if !defined(AK_OS_WINDOWS)
+    // The Emacs client is not asked where to save, so a page gets to save nothing.
+    if (browser_options().headless_mode == HeadlessMode::Emacs) {
+        EmacsServer::did_block_download(Web::sanitize_suggested_download_filename(file));
+        return Error::from_errno(ECANCELED);
+    }
+#endif
+
     auto downloads_directory = Core::StandardPaths::downloads_directory();
 
     if (!FileSystem::is_directory(downloads_directory)) {

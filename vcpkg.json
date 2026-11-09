@@ -265,7 +265,11 @@
     "woff2",
     "wuffs",
     "zlib",
-    "zmij"
+    "zmij",
+    {
+      "name": "zstd",
+      "platform": "!windows"
+    }
   ],
   "features": {
     "qt": {

@@ -121,7 +121,7 @@ elseif (LINUX)
 endif()
 
 if (NOT WIN32)
-    list(APPEND SOURCES TerminalInputParser.cpp TerminalWebView.cpp)
+    list(APPEND SOURCES EmacsFrameEncoder.cpp EmacsProtocol.cpp EmacsTransport.cpp EmacsWebView.cpp TerminalInputParser.cpp TerminalWebView.cpp)
 endif()
 
 if (LINUX OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
@@ -184,6 +184,10 @@ endif()
 
 target_link_libraries(LibWebView PUBLIC LibCompositing LibPlatformFeatures LibSandbox LibWebCommon)
 target_link_libraries(LibWebView PRIVATE LibCore LibCrypto LibDatabase LibDevTools LibFileSystem LibGfx LibHTTP LibImageDecoderClient LibIPC LibRequests LibMedia LibMediaClient LibUnicode LibURL LibTextCodec LibThreading)
+
+if (NOT WIN32)
+    target_link_libraries(LibWebView PRIVATE $<IF:$<TARGET_EXISTS:zstd::libzstd_shared>,zstd::libzstd_shared,zstd::libzstd_static>)
+endif()
 
 if (LINUX)
     # The connect broker asks the audio library where the daemon is before connecting a helper to it.
