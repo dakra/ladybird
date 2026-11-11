@@ -2961,6 +2961,24 @@ void WebContentPage::did_forward_pinch_event_to_child_frame(Web::HTML::CrossProc
     host.async_pinch_event_in_hosted_root(frame_id, event);
 }
 
+void WebContentPage::did_collect_hints(u64 request_id, JsonValue result)
+{
+    if (view().on_hints_collected)
+        view().on_hints_collected(*this, request_id, result);
+}
+
+void WebContentPage::did_prepare_hint_activation(u64 request_id, JsonValue result)
+{
+    if (view().on_hint_activation_prepared)
+        view().on_hint_activation_prepared(*this, request_id, result);
+}
+
+void WebContentPage::did_finish_hint_activation(u64 request_id, bool clicked)
+{
+    if (view().on_hint_activation_finished)
+        view().on_hint_activation_finished(*this, request_id, clicked);
+}
+
 void WebContentPage::did_destroy_child_frame(Web::HTML::CrossProcessId frame_id)
 {
     auto child_frame = traversable().find(frame_id);

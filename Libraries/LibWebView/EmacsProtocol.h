@@ -16,6 +16,8 @@
 #include <AK/Types.h>
 #include <AK/Vector.h>
 #include <LibGfx/Cursor.h>
+#include <LibGfx/Rect.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/UIEvents/KeyCode.h>
 #include <LibWebCommon/UIEvents/MouseButton.h>
 #include <LibWebView/Export.h>
@@ -106,19 +108,78 @@ enum class HintKind : u8 {
 };
 
 struct HintItem {
+    // The element, as the process hosting its document names it.
+    i64 node { 0 };
     HintKind kind { HintKind::Other };
     String text;
     Optional<String> url;
+    // In the device pixels of the viewport of the item's local root.
     double x { 0 };
     double y { 0 };
     double width { 0 };
     double height { 0 };
 };
 
-struct HintCollection {
+// The items of one document of a process.
+struct HintRoot {
+    // The local root whose viewport the boxes are in: the top-level traversable (none), or a frame whose parent another
+    // process hosts.
+    Optional<Web::HTML::CrossProcessId> navigable;
+    // The navigable of the document, which is the local root's or that of a frame the same process hosts in it.
+    Optional<Web::HTML::CrossProcessId> frame;
     Vector<HintItem> items;
+};
+
+// A frame another process hosts, and whether its parent's document shows it.
+struct HintFrame {
+    Web::HTML::CrossProcessId navigable;
+    bool exposed { false };
+};
+
+// What a process found that can be clicked in the documents it hosts.
+struct HintAnswer {
+    Vector<HintRoot> roots;
+    Vector<HintFrame> frames;
+    // The process left candidates out.
     bool truncated { false };
 };
+
+// A navigable of the tab as the UI process knows it, against which it checks what the processes report.
+struct HintNavigable {
+    Web::HTML::CrossProcessId id;
+    // The index of the parent in the list of navigables, which is in tree order.
+    Optional<size_t> parent;
+    // The process hosting its document, as an index the caller chooses.
+    size_t host { 0 };
+    // Its parent's document is in another process.
+    bool remote { false };
+    // The origin of the viewport of the local root that holds it, in the device pixels of the top-level viewport.
+    Gfx::IntPoint local_root_offset;
+    // For a remote navigable, the part of its viewport the top-level viewport shows, in its own device pixels.
+    Gfx::IntRect visible;
+};
+
+struct HintAnswerFromProcess {
+    size_t host { 0 };
+    HintAnswer answer;
+};
+
+struct HintListItem {
+    size_t host { 0 };
+    // In the CSS pixels of the top-level viewport, cut to what the item's frames show of it.
+    HintItem item;
+};
+
+struct HintList {
+    Vector<HintListItem> items;
+    bool truncated { false };
+};
+
+// The items of the answers, in the tree order of their documents' navigables, with what a process may not report left
+// out: a process speaks only for the documents it hosts, and only the process hosting a frame's parent says whether it
+// shows the frame. A frame another process hosts adds items only when that process says it shows the frame, and the same
+// holds for every such frame it is in. The first navigable is the top-level traversable.
+WEBVIEW_API HintList merge_hint_answers(Vector<HintAnswerFromProcess> const&, Vector<HintNavigable> const& navigables, Gfx::IntSize viewport, double device_pixels_per_css_pixel);
 
 // 2 to 36 distinct characters of a-z and 0-9.
 WEBVIEW_API bool is_valid_hint_alphabet(StringView);
@@ -135,8 +196,10 @@ WEBVIEW_API String hint_label_mask(Vector<String> const& labels, StringView pref
 // The index of an item that hints_end asks to activate, if `activate` names one of COUNT items.
 WEBVIEW_API Optional<size_t> hint_activation_index(JsonValue const& activate, size_t count);
 WEBVIEW_API StringView hint_kind_name(HintKind);
-// What the page's hint script reports of the elements it found, as JSON. The page can write anything there: a field of
-// the wrong type gets a default, text is cut to its limit, and an item beyond the limit makes the collection truncated.
-WEBVIEW_API ErrorOr<HintCollection> parse_hint_collection(StringView json);
+// A process names a navigable as "NAMESPACE:LOCAL".
+WEBVIEW_API Optional<Web::HTML::CrossProcessId> hint_navigable_from_name(StringView);
+// The answer of a process to a hint collection. A field of the wrong type gets a default, text is cut to its limit, an
+// item without a node is left out, and items beyond 1001 are.
+WEBVIEW_API ErrorOr<HintAnswer> parse_hint_answer(JsonValue const&);
 
 }

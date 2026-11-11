@@ -677,6 +677,7 @@ set(SOURCES
     Page/DragAndDropEventHandler.cpp
     Page/ElementResizeAction.cpp
     Page/EventHandler.cpp
+    Page/GuardedClick.cpp
     Page/MiddleButtonScrollHandler.cpp
     Page/Page.cpp
     Page/PageCursor.cpp

@@ -359,6 +359,10 @@ public:
     bool scales_frames_to_fit() const { return m_scales_frames_to_fit; }
     void enable_picture_in_picture_controls();
     void enqueue_input_event(Web::InputEvent);
+    // Input that reaches the page on the connection the view's commands to it take, after the commands sent before it.
+    void enqueue_input_event_bypassing_compositor(Web::InputEvent);
+    // The id the next input event the view sends gets.
+    u64 next_input_event_id() const { return m_next_input_event_id; }
     // The page reporting on an event must be the one handling it.
     void did_finish_handling_input_event(Badge<WebContentPage>, WebContentPage const& reporting_page, u64 event_id, Web::EventResult event_result);
     void did_forward_input_event(Badge<WebContentPage>, WebContentPage const& reporting_page, u64 event_id, WebContentPage& endpoint);
@@ -720,6 +724,9 @@ public:
     DevTools::DevToolsDelegate::OnDebuggerPaused on_debugger_paused;
     DevTools::DevToolsDelegate::OnDebuggerResumed on_debugger_resumed;
     Function<void(DebuggerValue)> on_received_js_console_result;
+    Function<void(WebContentPage&, u64 request_id, JsonValue const&)> on_hints_collected;
+    Function<void(WebContentPage&, u64 request_id, JsonValue const&)> on_hint_activation_prepared;
+    Function<void(WebContentPage&, u64 request_id, bool clicked)> on_hint_activation_finished;
     Function<void(ConsoleOutput)> on_console_message;
     Function<void(Web::UniqueNodeID)> on_inspect_element_request;
     Function<void(u64 request_id, URL::URL const&, ByteString const&, Vector<HTTP::Header> const&, ByteBuffer, Optional<String>, String, bool, Web::Fetch::Infrastructure::RequestPriority)> on_network_request_started;
@@ -1048,6 +1055,9 @@ protected:
         // Set once a page forwarded the event to a child frame another process hosts.
         bool forwarded_to_child_frame { false };
 
+        // Whether the compositor may handle the event before the page does.
+        bool may_route_through_compositor { true };
+
         // Unset while the event waits for the compositor to decide where an earlier key event goes.
         bool sent { false };
 
@@ -1075,6 +1085,11 @@ protected:
         Web::Clipboard::SystemClipboardItem item;
     };
     Optional<ClipboardWrite> m_last_clipboard_write_by_a_page;
+    enum class RouteThroughCompositor : u8 {
+        No,
+        Yes,
+    };
+    void enqueue_input_event(Web::InputEvent, RouteThroughCompositor);
     void send_queued_input_events();
     void send_input_event(size_t index);
     bool may_scroll_for_key_event_in_compositor(size_t index) const;

@@ -204,6 +204,13 @@ private:
     virtual void delete_indexed_database_record(Web::PageId page_id, u64 request_id, String host, String name) override;
     virtual void clear_inspected_dom_node(Web::PageId page_id) override;
     virtual void highlight_dom_node(Web::PageId page_id, Web::UniqueNodeID node_id, Optional<Web::CSS::PseudoElement> pseudo_element) override;
+    virtual void hints_collect(Web::PageId page_id, u64 request_id) override;
+    virtual void hints_draw(Web::PageId page_id, JsonValue labels) override;
+    virtual void hints_narrow(Web::PageId page_id, String prefix) override;
+    virtual void hints_clear(Web::PageId page_id) override;
+    virtual void hints_activate(Web::PageId page_id, u64 request_id, Web::UniqueNodeID node_id) override;
+    virtual void hints_guard_click(Web::PageId page_id, u64 request_id, Optional<Web::UniqueNodeID> element, Optional<Web::HTML::CrossProcessId> frame, Optional<Web::HTML::CrossProcessId> root, Vector<u64> event_ids) override;
+    virtual void hints_cancel_click(Web::PageId page_id, u64 request_id) override;
     virtual void highlight_flexbox(Web::PageId page_id, Web::UniqueNodeID node_id, JsonValue options) override;
     virtual void clear_flexbox_highlight(Web::PageId page_id, Web::UniqueNodeID node_id) override;
     virtual void highlight_grid(Web::PageId page_id, Web::UniqueNodeID node_id, JsonValue options) override;

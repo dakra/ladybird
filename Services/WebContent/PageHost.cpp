@@ -11,6 +11,7 @@
 
 #include <WebContent/ConnectionFromClient.h>
 #include <WebContent/PageClient.h>
+#include <WebContent/PageHints.h>
 #include <WebContent/PageHost.h>
 #include <WebContent/WebContentCompositorHost.h>
 #include <WebContent/WebDriverConnection.h>
@@ -69,6 +70,7 @@ void PageHost::remove_page(Badge<PageClient>, Web::PageId page_id)
         page.value()->page().hover_link().set_send({});
     }
     m_pages.remove(page_id);
+    PageHints::forget(page_id);
 }
 
 void PageHost::for_each_page(Function<void(PageClient&)> callback)

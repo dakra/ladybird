@@ -47,6 +47,7 @@
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/TreeBuilderRustFFI.h>
 #include <LibWeb/Page/EventHandler.h>
+#include <LibWeb/Page/GuardedClick.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/PaintTiming/PaintTiming.h>
@@ -573,6 +574,18 @@ void EventLoop::process_input_events() const
                 if (input_is_outdated && mouse_event->buttons == 0 && first_is_one_of(mouse_event->type, Web::MouseEvent::Type::MouseMove, Web::MouseEvent::Type::MouseLeave)) {
                     finish_handling_coalesced_input_events(event);
                     finish_handling_input_event(mouse_event->id, EventResult::Dropped, InputRoutingDecision::DroppedOutdatedPointerMove);
+                    continue;
+                }
+            }
+            // An event of a click the browser made on an element it chose reaches the page only while it still hits
+            // that element, or the frame the element is in.
+            if (auto const* mouse_event = event.event.get_pointer<Web::MouseEvent>()) {
+                auto decision = decide_guarded_click(page, *root, event.navigable_id, *mouse_event);
+                if (decision == GuardedClickDecision::DropAndCancelPress)
+                    (void)page.handle_mousecancel(*root);
+                if (decision == GuardedClickDecision::Drop || decision == GuardedClickDecision::DropAndCancelPress) {
+                    finish_handling_coalesced_input_events(event);
+                    finish_handling_input_event(mouse_event->id, EventResult::Dropped, InputRoutingDecision::FinishedDropped);
                     continue;
                 }
             }

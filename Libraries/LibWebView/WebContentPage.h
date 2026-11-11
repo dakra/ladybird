@@ -374,6 +374,9 @@ private:
     virtual void did_forward_mouse_event_to_child_frame(Web::HTML::CrossProcessId frame_id, Web::MouseEvent) override;
     virtual void did_forward_pinch_event_to_child_frame(Web::HTML::CrossProcessId frame_id, Web::PinchEvent) override;
     virtual void did_destroy_child_frame(Web::HTML::CrossProcessId frame_id) override;
+    virtual void did_collect_hints(u64 request_id, JsonValue result) override;
+    virtual void did_prepare_hint_activation(u64 request_id, JsonValue result) override;
+    virtual void did_finish_hint_activation(u64 request_id, bool clicked) override;
     Messages::WebContentClient::DidStartDownloadWithoutRequestResponse did_start_download_without_request(URL::URL url, ByteString suggested_filename, Optional<u64> total_size);
     Messages::WebContentClient::DidStartDownloadResponse did_start_download(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, HTTP::Cookie::SameSiteContext same_site_context, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data,
         JsonValue network_response);

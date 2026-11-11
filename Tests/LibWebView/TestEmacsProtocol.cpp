@@ -6,6 +6,7 @@
 
 #include <AK/Endian.h>
 #include <AK/HashTable.h>
+#include <AK/JsonArray.h>
 #include <AK/Math.h>
 #include <AK/StringBuilder.h>
 #include <LibTest/TestCase.h>
@@ -306,30 +307,63 @@ TEST_CASE(hint_activation_indices)
     EXPECT(!hint_activation_index(0, 0).has_value());
 }
 
-TEST_CASE(hint_collections_are_checked)
+static HintAnswer parse_answer(StringView json)
 {
-    EXPECT(parse_hint_collection("null"sv).is_error());
-    EXPECT(parse_hint_collection("[]"sv).is_error());
-    EXPECT(parse_hint_collection("{\"items\":7}"sv).is_error());
-    EXPECT(parse_hint_collection("{\"items\":["sv).is_error());
+    return MUST(parse_hint_answer(MUST(JsonValue::from_string(json))));
+}
 
-    auto empty = MUST(parse_hint_collection("{\"items\":[]}"sv));
-    EXPECT(empty.items.is_empty());
-    EXPECT(!empty.truncated);
+TEST_CASE(hint_navigable_names)
+{
+    auto id = hint_navigable_from_name("2:17"sv);
+    VERIFY(id.has_value());
+    EXPECT_EQ(id->namespace_id, 2u);
+    EXPECT_EQ(id->local_id, 17u);
+    EXPECT(hint_navigable_from_name("18446744073709551615:1"sv).has_value());
+    EXPECT(!hint_navigable_from_name(""sv).has_value());
+    EXPECT(!hint_navigable_from_name("2"sv).has_value());
+    EXPECT(!hint_navigable_from_name("2:"sv).has_value());
+    EXPECT(!hint_navigable_from_name("2:3:4"sv).has_value());
+    EXPECT(!hint_navigable_from_name(" 2:3"sv).has_value());
+    EXPECT(!hint_navigable_from_name("-2:3"sv).has_value());
+    EXPECT(!hint_navigable_from_name("18446744073709551616:1"sv).has_value());
+}
 
-    auto collection = MUST(parse_hint_collection(R"~({"items":[
-        {"kind":"link","text":"Home","url":"https://example.org/a/../b","x":1.5,"y":2,"width":30,"height":10},
-        {"kind":"button","text":"OK","url":"https://example.org/","x":"1","y":null,"width":1e400,"height":-1},
-        {"kind":"input","text":7},
-        {"kind":"evil","text":"x"},
-        {"kind":"link","url":"not a url"},
-        {"kind":"link","url":"javascript:alert(1)"},
+TEST_CASE(hint_answers_are_checked)
+{
+    EXPECT(parse_hint_answer(JsonValue {}).is_error());
+    EXPECT(parse_hint_answer(JsonArray {}).is_error());
+    EXPECT(parse_hint_answer(MUST(JsonValue::from_string("{\"roots\":[]}"sv))).is_error());
+    EXPECT(parse_hint_answer(MUST(JsonValue::from_string("{\"roots\":7,\"frames\":[]}"sv))).is_error());
+
+    auto empty = parse_answer("{\"roots\":[],\"frames\":[]}"sv);
+    EXPECT(empty.roots.is_empty());
+    EXPECT(empty.frames.is_empty());
+
+    auto answer = parse_answer(R"~({"roots":[
+        {"navigable":null,"frame":null,"items":[
+            {"node":5,"kind":"link","text":"Home","url":"https://example.org/a/../b","x":1.5,"y":2,"width":30,"height":10},
+            {"node":6,"kind":"button","text":"OK","url":"https://example.org/","x":"1","y":null,"width":1e400,"height":-1},
+            {"node":"7","kind":"button"},
+            {"node":8,"kind":"input","text":7},
+            {"node":9,"kind":"evil","text":"x"},
+            {"node":10,"kind":"link","url":"not a url"},
+            {"node":11,"kind":"link","url":"javascript:alert(1)"},
+            "junk"
+        ]},
+        {"navigable":"3:4","frame":"3:5","items":[{"node":1,"kind":"other"}]},
+        {"navigable":"bad","items":[{"node":2}]},
+        {"navigable":"3:4","frame":7,"items":[{"node":3}]},
         "junk"
-    ]})~"sv));
-    VERIFY(collection.items.size() == 7);
-    EXPECT(!collection.truncated);
+    ],"frames":[{"navigable":"3:4","exposed":true},7,{"navigable":"3:6"},{"navigable":"x","exposed":true}]})~"sv);
 
-    auto const& link = collection.items[0];
+    VERIFY(answer.roots.size() == 3);
+    auto const& top = answer.roots[0];
+    EXPECT(!top.navigable.has_value());
+    EXPECT(!top.frame.has_value());
+    VERIFY(top.items.size() == 6);
+
+    auto const& link = top.items[0];
+    EXPECT_EQ(link.node, 5);
     EXPECT(link.kind == HintKind::Link);
     EXPECT_EQ(link.text, "Home"_string);
     EXPECT_EQ(link.url, "https://example.org/b"_string);
@@ -338,46 +372,168 @@ TEST_CASE(hint_collections_are_checked)
     EXPECT_EQ(link.width, 30.0);
     EXPECT_EQ(link.height, 10.0);
 
-    auto const& button = collection.items[1];
+    auto const& button = top.items[1];
     EXPECT(button.kind == HintKind::Button);
     EXPECT(!button.url.has_value());
     EXPECT_EQ(button.x, 0.0);
     EXPECT_EQ(button.y, 0.0);
     EXPECT_EQ(button.height, -1.0);
 
-    EXPECT(collection.items[2].kind == HintKind::Input);
-    EXPECT(collection.items[2].text.is_empty());
-    EXPECT(collection.items[3].kind == HintKind::Other);
-    EXPECT(!collection.items[4].url.has_value());
-    EXPECT_EQ(collection.items[5].url, "javascript:alert(1)"_string);
-    EXPECT(collection.items[6].kind == HintKind::Other);
-    EXPECT_EQ(hint_kind_name(collection.items[6].kind), "other"sv);
+    EXPECT_EQ(top.items[2].node, 8);
+    EXPECT(top.items[2].kind == HintKind::Input);
+    EXPECT(top.items[2].text.is_empty());
+    EXPECT(top.items[3].kind == HintKind::Other);
+    EXPECT(!top.items[4].url.has_value());
+    EXPECT_EQ(top.items[5].url, "javascript:alert(1)"_string);
+    EXPECT_EQ(hint_kind_name(top.items[3].kind), "other"sv);
+
+    auto const& frame_root = answer.roots[1];
+    EXPECT_EQ(frame_root.navigable->local_id, 4u);
+    EXPECT_EQ(frame_root.frame->local_id, 5u);
+    // A frame name that is no name is the top-level document's, which only the page displaying the tab may list.
+    EXPECT(!answer.roots[2].frame.has_value());
+
+    VERIFY(answer.frames.size() == 2);
+    EXPECT(answer.frames[0].exposed);
+    EXPECT_EQ(answer.frames[1].navigable.local_id, 6u);
+    EXPECT(!answer.frames[1].exposed);
 }
 
-TEST_CASE(hint_collections_are_bounded)
+TEST_CASE(hint_answers_are_bounded)
 {
     StringBuilder json;
-    json.append("{\"items\":["sv);
+    json.append("{\"frames\":[],\"roots\":[{\"items\":["sv);
     for (size_t i = 0; i < maximum_hint_count + 5; ++i) {
         if (i != 0)
             json.append(',');
-        json.appendff("{{\"kind\":\"link\",\"text\":\"{}\",\"url\":\"https://example.org/{}\",\"x\":1e300}}", MUST(String::repeated('t', 300)), MUST(String::repeated('p', i == 0 ? maximum_hint_url_length : 10)));
+        json.appendff("{{\"node\":{},\"kind\":\"link\",\"text\":\"{}\",\"url\":\"https://example.org/{}\",\"x\":1e300}}", i, MUST(String::repeated('t', 300)), MUST(String::repeated('p', i == 0 ? maximum_hint_url_length : 10)));
     }
-    json.append("]}"sv);
+    json.append("]},{\"items\":[{\"node\":1}]}]}"sv);
 
-    auto collection = MUST(parse_hint_collection(json.string_view()));
-    EXPECT_EQ(collection.items.size(), maximum_hint_count);
-    EXPECT(collection.truncated);
-    EXPECT_EQ(collection.items[0].text.bytes().size(), maximum_hint_text_length);
-    EXPECT(!collection.items[0].url.has_value());
-    EXPECT(collection.items[1].url.has_value());
-    EXPECT_EQ(collection.items[1].x, 1e9);
+    auto answer = parse_answer(json.string_view());
+    VERIFY(answer.roots.size() == 2);
+    EXPECT_EQ(answer.roots[0].items.size(), maximum_hint_count + 1);
+    EXPECT(answer.roots[1].items.is_empty());
+    EXPECT_EQ(answer.roots[0].items[0].text.bytes().size(), maximum_hint_text_length);
+    EXPECT(!answer.roots[0].items[0].url.has_value());
+    EXPECT(answer.roots[0].items[1].url.has_value());
+    EXPECT_EQ(answer.roots[0].items[1].x, 1e9);
 
     // Text is cut at a code point, and a lone surrogate becomes a replacement character.
     StringBuilder text;
     for (size_t i = 0; i < maximum_hint_text_length + 3; ++i)
         text.append("\xc3\xa9"sv);
-    auto cut = MUST(parse_hint_collection(MUST(String::formatted("{{\"items\":[{{\"text\":\"{}\"}},{{\"text\":\"a\\ud800b\"}}]}}", text.string_view()))));
-    EXPECT_EQ(cut.items[0].text.bytes().size(), maximum_hint_text_length * 2);
-    EXPECT_EQ(cut.items[1].text, "a\uFFFDb"_string);
+    auto cut = parse_answer(MUST(String::formatted("{{\"frames\":[],\"roots\":[{{\"items\":[{{\"node\":1,\"text\":\"{}\"}},{{\"node\":2,\"text\":\"a\\ud800b\"}}]}}]}}", text.string_view())));
+    EXPECT_EQ(cut.roots[0].items[0].text.bytes().size(), maximum_hint_text_length * 2);
+    EXPECT_EQ(cut.roots[0].items[1].text, "a�b"_string);
+}
+
+static Web::HTML::CrossProcessId navigable_id(u64 local_id)
+{
+    return { .namespace_id = 1, .local_id = local_id };
+}
+
+static HintItem hint_item(i64 node, double x, double y, double width = 10, double height = 10)
+{
+    HintItem item;
+    item.node = node;
+    item.x = x;
+    item.y = y;
+    item.width = width;
+    item.height = height;
+    return item;
+}
+
+// The top-level document (host 0) holds frame A of another site (host 1), which holds frame B of its own site and frame
+// D of the top-level document's site (host 0 again); the top-level document also holds frame C (host 2).
+static Vector<HintNavigable> example_navigables()
+{
+    return {
+        { navigable_id(10), {}, 0, false, {}, {} },
+        { navigable_id(11), 0, 1, true, { 100, 50 }, { 0, 0, 200, 100 } },
+        { navigable_id(12), 1, 1, false, { 100, 50 }, {} },
+        { navigable_id(14), 1, 0, true, { 120, 70 }, { 0, 0, 50, 50 } },
+        { navigable_id(13), 0, 2, true, { 400, 0 }, { 0, 0, 50, 50 } },
+    };
+}
+
+TEST_CASE(hint_answers_are_merged_in_tree_order)
+{
+    HintAnswer top_level;
+    top_level.roots.append({ {}, {}, { hint_item(1, 0, 0) } });
+    top_level.roots.append({ navigable_id(14), navigable_id(14), { hint_item(4, 10, 10) } });
+    top_level.frames.append({ navigable_id(11), true });
+    top_level.frames.append({ navigable_id(13), true });
+
+    HintAnswer frame;
+    frame.roots.append({ navigable_id(11), navigable_id(12), { hint_item(3, 20, 20) } });
+    frame.roots.append({ navigable_id(11), navigable_id(11), { hint_item(2, 190, 0, 20, 20), hint_item(5, 300, 0) } });
+    frame.frames.append({ navigable_id(14), true });
+
+    auto list = merge_hint_answers({ { 0, top_level }, { 1, frame } }, example_navigables(), { 800, 600 }, 2);
+    VERIFY(list.items.size() == 4);
+    EXPECT(!list.truncated);
+    EXPECT_EQ(list.items[0].item.node, 1);
+    EXPECT_EQ(list.items[0].host, 0u);
+    // In the frame's visible part, moved by its offset, in CSS pixels.
+    EXPECT_EQ(list.items[1].item.node, 2);
+    EXPECT_EQ(list.items[1].host, 1u);
+    EXPECT_EQ(list.items[1].item.x, 145.0);
+    EXPECT_EQ(list.items[1].item.y, 25.0);
+    EXPECT_EQ(list.items[1].item.width, 5.0);
+    EXPECT_EQ(list.items[1].item.height, 10.0);
+    EXPECT_EQ(list.items[2].item.node, 3);
+    EXPECT_EQ(list.items[3].item.node, 4);
+    EXPECT_EQ(list.items[3].host, 0u);
+    EXPECT_EQ(list.items[3].item.x, 65.0);
+}
+
+TEST_CASE(hint_answers_speak_only_for_what_their_process_hosts)
+{
+    HintAnswer top_level;
+    top_level.roots.append({ {}, {}, { hint_item(1, 0, 0) } });
+    // Frame D's parent is in host 1, which alone says whether D shows; and the items of frame C are host 2's to report.
+    top_level.roots.append({ navigable_id(14), navigable_id(14), { hint_item(4, 10, 10) } });
+    top_level.roots.append({ navigable_id(13), navigable_id(13), { hint_item(6, 0, 0) } });
+    top_level.frames.append({ navigable_id(11), true });
+    top_level.frames.append({ navigable_id(13), true });
+    top_level.frames.append({ navigable_id(14), true });
+
+    HintAnswer frame;
+    // A document of host 1 named under a local root that does not hold it, and the top-level document.
+    frame.roots.append({ navigable_id(14), navigable_id(12), { hint_item(7, 0, 0) } });
+    frame.roots.append({ {}, {}, { hint_item(8, 0, 0) } });
+    frame.roots.append({ navigable_id(11), navigable_id(11), { hint_item(2, 0, 0) } });
+    frame.frames.append({ navigable_id(14), false });
+    frame.truncated = true;
+
+    auto list = merge_hint_answers({ { 0, top_level }, { 1, frame } }, example_navigables(), { 800, 600 }, 1);
+    VERIFY(list.items.size() == 2);
+    EXPECT_EQ(list.items[0].item.node, 1);
+    EXPECT_EQ(list.items[1].item.node, 2);
+    EXPECT(list.truncated);
+
+    // A frame whose parent's process did not say it shows lists nothing, nor does anything in it.
+    HintAnswer silent_parent;
+    silent_parent.roots.append({ {}, {}, { hint_item(1, 0, 0) } });
+    silent_parent.roots.append({ navigable_id(14), navigable_id(14), { hint_item(4, 10, 10) } });
+    auto without_frames = merge_hint_answers({ { 0, silent_parent } }, example_navigables(), { 800, 600 }, 1);
+    VERIFY(without_frames.items.size() == 1);
+    EXPECT_EQ(without_frames.items[0].item.node, 1);
+}
+
+TEST_CASE(hint_answers_are_cut_to_the_viewport_and_the_limit)
+{
+    HintAnswer top_level;
+    Vector<HintItem> items;
+    items.append(hint_item(1, -20, -20, 10, 10));
+    items.append(hint_item(2, 795, 595, 10, 10));
+    for (size_t i = 0; i < maximum_hint_count + 2; ++i)
+        items.append(hint_item(100 + i, 0, 0));
+    top_level.roots.append({ {}, {}, move(items) });
+    auto list = merge_hint_answers({ { 0, top_level } }, example_navigables(), { 800, 600 }, 1);
+    EXPECT_EQ(list.items.size(), maximum_hint_count);
+    EXPECT(list.truncated);
+    EXPECT_EQ(list.items[0].item.node, 2);
+    EXPECT_EQ(list.items[0].item.width, 5.0);
 }

@@ -261,6 +261,14 @@ endpoint WebContentServer routed by Web::PageId page_id
     find_in_page_previous_match(Web::PageId page_id) =|
     find_in_page_end(Web::PageId page_id) =|
 
+    hints_collect(Web::PageId page_id, u64 request_id) =|
+    hints_draw(Web::PageId page_id, JsonValue labels) =|
+    hints_narrow(Web::PageId page_id, String prefix) =|
+    hints_clear(Web::PageId page_id) =|
+    hints_activate(Web::PageId page_id, u64 request_id, Web::UniqueNodeID node_id) =|
+    hints_guard_click(Web::PageId page_id, u64 request_id, Optional<Web::UniqueNodeID> element, Optional<Web::HTML::CrossProcessId> frame, Optional<Web::HTML::CrossProcessId> root, Vector<u64> event_ids) =|
+    hints_cancel_click(Web::PageId page_id, u64 request_id) =|
+
     set_content_blocking_policy(Web::PageId page_id, bool enabled, Vector<String> disabled_sites) =|
     set_content_blockers(Core::AnonymousBuffer patterns) =|
 

@@ -112,6 +112,7 @@
 #include <WebContent/DevToolsDebugger.h>
 #include <WebContent/DevToolsIndexedDB.h>
 #include <WebContent/PageClient.h>
+#include <WebContent/PageHints.h>
 #include <WebContent/PageHost.h>
 #include <WebContent/TestConnection.h>
 #include <WebContent/WebContentClientEndpoint.h>
@@ -2006,6 +2007,57 @@ void ConnectionFromClient::highlight_dom_node(Web::PageId page_id, Web::UniqueNo
         return;
 
     document.set_highlighted_node(node, pseudo_element);
+}
+
+void ConnectionFromClient::hints_collect(Web::PageId page_id, u64 request_id)
+{
+    auto page = this->page(page_id);
+    if (!page.has_value()) {
+        async_did_collect_hints(page_id, request_id, JsonValue {});
+        return;
+    }
+    async_did_collect_hints(page_id, request_id, PageHints::collect(page->page()));
+}
+
+void ConnectionFromClient::hints_draw(Web::PageId page_id, JsonValue labels)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        PageHints::draw(page->page(), labels);
+}
+
+void ConnectionFromClient::hints_narrow(Web::PageId page_id, String prefix)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        PageHints::narrow(page->page(), prefix);
+}
+
+void ConnectionFromClient::hints_clear(Web::PageId page_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        PageHints::clear(page->page());
+}
+
+void ConnectionFromClient::hints_activate(Web::PageId page_id, u64 request_id, Web::UniqueNodeID node_id)
+{
+    auto page = this->page(page_id);
+    async_did_prepare_hint_activation(page_id, request_id, page.has_value() ? PageHints::prepare_activation(page->page(), node_id) : JsonValue {});
+}
+
+void ConnectionFromClient::hints_guard_click(Web::PageId page_id, u64 request_id, Optional<Web::UniqueNodeID> element, Optional<Web::HTML::CrossProcessId> frame, Optional<Web::HTML::CrossProcessId> root, Vector<u64> event_ids)
+{
+    auto page = this->page(page_id);
+    if (!page.has_value())
+        return;
+    PageHints::guard_click(page->page(), request_id, element, frame, root, move(event_ids), [weak_this = make_weak_ptr<ConnectionFromClient>(), page_id, request_id](bool clicked) {
+        if (weak_this)
+            weak_this->async_did_finish_hint_activation(page_id, request_id, clicked);
+    });
+}
+
+void ConnectionFromClient::hints_cancel_click(Web::PageId page_id, u64 request_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        PageHints::cancel_click(page->page(), request_id);
 }
 
 static Web::Painting::FlexboxInspectorOverlayOptions flexbox_inspector_overlay_options_from_json(JsonValue const& options)

@@ -1300,6 +1300,16 @@ static constexpr auto longest_user_activation_delivery = AK::Duration::from_seco
 
 void ViewImplementation::enqueue_input_event(Web::InputEvent event)
 {
+    enqueue_input_event(move(event), RouteThroughCompositor::Yes);
+}
+
+void ViewImplementation::enqueue_input_event_bypassing_compositor(Web::InputEvent event)
+{
+    enqueue_input_event(move(event), RouteThroughCompositor::No);
+}
+
+void ViewImplementation::enqueue_input_event(Web::InputEvent event, RouteThroughCompositor route_through_compositor)
+{
     // NB: A pinch event's scale delta must be finite to be sent over IPC. Drop a pinch event the platform gave us
     //     with a scale delta that is not finite.
     if (auto const* pinch_event = event.get_pointer<Web::PinchEvent>(); pinch_event && !isfinite(pinch_event->scale_delta))
@@ -1352,6 +1362,7 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
     m_pending_input_events.append({ move(event), page() });
 
     auto& pending = m_pending_input_events.last();
+    pending.may_route_through_compositor = route_through_compositor == RouteThroughCompositor::Yes;
     if (gives_user_activation) {
         auto now = MonotonicTime::now();
         pending.user_activation_time = now;
@@ -1430,7 +1441,7 @@ void ViewImplementation::send_input_event(size_t index)
         [&](Web::MouseEvent const& event) {
             // The compositor scrolls or drags a scrollbar for the event when it can, then forwards the event to
             // WebContent behind the scroll updates that produced, consumes it, or hands it back for direct dispatch.
-            if (!event.pointer_data.ptr() && pending.endpoint->handle_and_dispatch_mouse_event_in_compositor(event))
+            if (pending.may_route_through_compositor && !event.pointer_data.ptr() && pending.endpoint->handle_and_dispatch_mouse_event_in_compositor(event))
                 pending.routed_through_compositor = true;
             else
                 pending.endpoint->async_mouse_event(event.clone_without_browser_data());

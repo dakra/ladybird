@@ -5,6 +5,7 @@ set(SOURCES
     DevToolsDebugger.cpp
     DevToolsIndexedDB.cpp
     PageClient.cpp
+    PageHints.cpp
     PageHost.cpp
     TestConnection.cpp
     WebContentCompositorHost.cpp

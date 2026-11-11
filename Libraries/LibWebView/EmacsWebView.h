@@ -77,46 +77,54 @@ private:
         Optional<ByteString> path;
     };
 
-    // The scripts of a hint session whose answer the server waits for.
-    enum class HintScript : u8 {
-        Collect,
-        Draw,
-        Activate,
-        // Its answer is taken and dropped.
-        Ignore,
+    // An element a hint session labels, in the process hosting its document.
+    struct HintTarget {
+        NonnullRefPtr<WebContentPage> page;
+        Web::UniqueNodeID node { 0 };
     };
 
-    struct PendingHintScript {
-        HintScript kind { HintScript::Collect };
-        u64 session { 0 };
-        MonotonicTime deadline;
-    };
-
-    // The labels the client asked for, which the page holds under a global property only the server knows the name of.
+    // The labels the client asked for. Each process hosting a document of the tab finds what can be clicked in its
+    // documents and draws the labels there.
     struct HintSession {
         u64 serial { 0 };
         u64 id { 0 };
-        String name;
         String alphabet;
-        // What the page reported, until the labels are drawn and the client is sent the list.
-        Optional<EmacsProtocol::HintCollection> collection;
+        u64 collection_request { 0 };
+        // The processes asked, and those yet to answer.
+        Vector<NonnullRefPtr<WebContentPage>> pages;
+        Vector<WebContentPage*> pages_to_answer;
+        Vector<EmacsProtocol::HintAnswerFromProcess> answers;
+        Vector<HintTarget> targets;
         Vector<String> labels;
         bool listed { false };
         String prefix;
         RefPtr<Core::Timer> timeout;
+        // Started once the process of the top-level document answered, for the others to follow.
+        RefPtr<Core::Timer> grace;
+    };
+
+    // An activation a process was asked to prepare, which only that process answers, once.
+    struct HintActivation {
+        u64 session_id { 0 };
+        NonnullRefPtr<WebContentPage> page;
+        Web::UniqueNodeID node { 0 };
+        MonotonicTime deadline;
+    };
+
+    // A click on its way: the processes guarding it, of which the one hosting the element says when it is done.
+    struct HintClick {
+        u64 session_id { 0 };
+        Vector<NonnullRefPtr<WebContentPage>> pages;
+        NonnullRefPtr<WebContentPage> element_page;
+        MonotonicTime deadline;
     };
 
     enum class HintSessionEnd : u8 {
-        // The client ended it, or is gone: the page removes the labels.
+        // The client ended it, or is gone: the processes remove the labels.
         Silently,
-        // Another document is active: the client is told, and whichever document the session's scripts ran in forgets
-        // it.
-        Navigated,
-        // The page's process or view is gone: the client is told.
-        PageGone,
-        // The page did not answer in time, or not usably: the client is told, and the page removes the labels once it
-        // gets to it.
-        PageFailed,
+        // Another document is active, the page closed its view, or a process did not answer in time or usably: the
+        // client is told, and the processes remove what is left of the labels.
+        Cancelled,
     };
 
     EmacsWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize, double device_pixel_ratio, EmacsServer&, u32 id);
@@ -159,19 +167,13 @@ private:
     void handle_hints_narrow(JsonObject const&);
     void handle_hints_end(JsonObject const&);
     HintSession* hint_session_named_by(JsonObject const&);
-    void send_hint_error(StringView text, JsonObject const& request);
-    void run_hint_script(StringView body, HintScript = HintScript::Ignore);
-    void install_hint_dispatcher();
-    void dispatch_console_result(DebuggerValue);
-    void settle_console_result_callback(Function<void(DebuggerValue)> callback_that_was_called);
-    bool did_receive_hint_script_result(DebuggerValue const&);
-    void ignore_hint_scripts();
-    void did_collect_hints(StringView json);
-    void did_draw_hints(StringView result);
-    void did_end_hints(StringView json);
+    void send_hint_error(StringView text, JsonValue id);
+    void did_collect_hints(WebContentPage&, u64 request_id, JsonValue const&);
+    void list_hints();
     void send_hints_list(JsonArray items, bool truncated);
     void end_hint_session(HintSessionEnd, Optional<size_t> activate = {});
-    void click_at(Gfx::IntPoint);
+    void did_prepare_hint_activation(WebContentPage&, u64 request_id, JsonValue const&);
+    void did_finish_hint_activation(WebContentPage&, u64 request_id, bool clicked);
 
     // Asks the client, unless the request does not fit a record.
     Optional<u64> open_request(RequestKind, JsonObject);
@@ -245,10 +247,9 @@ private:
 
     Optional<HintSession> m_hint_session;
     u64 m_next_hint_session_serial { 1 };
-    // By the token a script's answer starts with.
-    HashMap<String, PendingHintScript> m_pending_hint_scripts;
-    bool m_hint_dispatcher_installed { false };
-    Function<void(DebuggerValue)> m_console_result_callback_before_hints;
+    u64 m_next_hint_request { 1 };
+    HashMap<u64, HintActivation> m_hint_activations;
+    HashMap<u64, HintClick> m_hint_clicks;
 };
 
 // The Emacs headless mode: one client at a time on a transport, and the view it shows, if any. The server keeps running,

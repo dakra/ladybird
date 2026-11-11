@@ -5,8 +5,11 @@
  */
 
 #include <AK/Endian.h>
+#include <AK/HashMap.h>
+#include <AK/HashTable.h>
 #include <AK/JsonArray.h>
 #include <AK/Math.h>
+#include <AK/QuickSort.h>
 #include <AK/StringBuilder.h>
 #include <AK/Utf8View.h>
 #include <LibURL/Parser.h>
@@ -353,50 +356,202 @@ static double hint_coordinate(JsonObject const& object, StringView key)
     return clamp(number, -maximum_coordinate, maximum_coordinate);
 }
 
-ErrorOr<HintCollection> parse_hint_collection(StringView json)
+Optional<Web::HTML::CrossProcessId> hint_navigable_from_name(StringView name)
 {
-    auto parsed = TRY(JsonValue::from_string(json));
-    if (!parsed.is_object())
-        return Error::from_string_literal("The hint collection is not an object");
-    auto items = parsed.as_object().get_array("items"sv);
-    if (!items.has_value())
-        return Error::from_string_literal("The hint collection has no items");
+    auto parts = name.split_view(':', SplitBehavior::KeepEmpty);
+    if (parts.size() != 2)
+        return {};
+    auto namespace_id = parts[0].to_number<u64>(TrimWhitespace::No);
+    auto local_id = parts[1].to_number<u64>(TrimWhitespace::No);
+    if (!namespace_id.has_value() || !local_id.has_value())
+        return {};
+    return Web::HTML::CrossProcessId { .namespace_id = *namespace_id, .local_id = *local_id };
+}
 
-    HintCollection collection;
-    collection.truncated = items->size() > maximum_hint_count;
-    collection.items.ensure_capacity(min(items->size(), maximum_hint_count));
-    for (size_t index = 0; index < items->size() && index < maximum_hint_count; ++index) {
-        HintItem item;
-        if (auto const& value = items->at(index); value.is_object()) {
-            auto const& object = value.as_object();
-            auto kind = object.get_string("kind"sv).value_or({});
-            if (kind == "link"sv)
-                item.kind = HintKind::Link;
-            else if (kind == "button"sv)
-                item.kind = HintKind::Button;
-            else if (kind == "input"sv)
-                item.kind = HintKind::Input;
+static Optional<HintItem> parse_hint_item(JsonValue const& value)
+{
+    if (!value.is_object())
+        return {};
+    auto const& object = value.as_object();
+    auto node = object.get("node"sv);
+    if (!node.has_value() || !node->is_integer<i64>())
+        return {};
 
-            if (auto text = object.get_string("text"sv); text.has_value())
-                item.text = hint_text(*text);
+    HintItem item;
+    item.node = node->as_integer<i64>();
+    auto kind = object.get_string("kind"sv).value_or({});
+    if (kind == "link"sv)
+        item.kind = HintKind::Link;
+    else if (kind == "button"sv)
+        item.kind = HintKind::Button;
+    else if (kind == "input"sv)
+        item.kind = HintKind::Input;
 
-            // NB: The URL is parsed again, so that what goes to the client is an absolute URL whatever the page wrote.
-            if (auto url = object.get_string("url"sv); item.kind == HintKind::Link && url.has_value() && url->byte_count() <= maximum_hint_url_length) {
-                if (auto parsed_url = URL::Parser::basic_parse(*url); parsed_url.has_value()) {
-                    auto serialized = parsed_url->serialize();
-                    if (serialized.byte_count() <= maximum_hint_url_length)
-                        item.url = move(serialized);
+    if (auto text = object.get_string("text"sv); text.has_value())
+        item.text = hint_text(*text);
+
+    // NB: The URL is parsed again, so that what goes to the client is an absolute URL whatever the process wrote.
+    if (auto url = object.get_string("url"sv); item.kind == HintKind::Link && url.has_value() && url->byte_count() <= maximum_hint_url_length) {
+        if (auto parsed_url = URL::Parser::basic_parse(*url); parsed_url.has_value()) {
+            auto serialized = parsed_url->serialize();
+            if (serialized.byte_count() <= maximum_hint_url_length)
+                item.url = move(serialized);
+        }
+    }
+
+    item.x = hint_coordinate(object, "x"sv);
+    item.y = hint_coordinate(object, "y"sv);
+    item.width = hint_coordinate(object, "width"sv);
+    item.height = hint_coordinate(object, "height"sv);
+    return item;
+}
+
+ErrorOr<HintAnswer> parse_hint_answer(JsonValue const& answer)
+{
+    // NB: Every frame of a page could report the frames it shows; more than this many is no page anyone uses.
+    static constexpr size_t maximum_frames = 10'000;
+
+    if (!answer.is_object())
+        return Error::from_string_literal("The hint answer is not an object");
+    auto roots = answer.as_object().get_array("roots"sv);
+    auto frames = answer.as_object().get_array("frames"sv);
+    if (!roots.has_value() || !frames.has_value())
+        return Error::from_string_literal("The hint answer has no roots or frames");
+
+    HintAnswer result;
+    size_t item_count = 0;
+    for (auto const& root_value : roots->values()) {
+        if (!root_value.is_object())
+            continue;
+        auto const& root_object = root_value.as_object();
+        HintRoot root;
+        if (auto name = root_object.get_string("navigable"sv); name.has_value()) {
+            root.navigable = hint_navigable_from_name(*name);
+            if (!root.navigable.has_value())
+                continue;
+        }
+        if (auto name = root_object.get_string("frame"sv); name.has_value()) {
+            root.frame = hint_navigable_from_name(*name);
+            if (!root.frame.has_value())
+                continue;
+        }
+        if (auto items = root_object.get_array("items"sv); items.has_value()) {
+            for (auto const& item_value : items->values()) {
+                if (item_count > maximum_hint_count)
+                    break;
+                if (auto item = parse_hint_item(item_value); item.has_value()) {
+                    root.items.append(item.release_value());
+                    ++item_count;
                 }
             }
-
-            item.x = hint_coordinate(object, "x"sv);
-            item.y = hint_coordinate(object, "y"sv);
-            item.width = hint_coordinate(object, "width"sv);
-            item.height = hint_coordinate(object, "height"sv);
         }
-        collection.items.unchecked_append(move(item));
+        result.roots.append(move(root));
     }
-    return collection;
+
+    result.truncated = item_count > maximum_hint_count || answer.as_object().get_bool("truncated"sv).value_or(false);
+
+    for (auto const& frame_value : frames->values()) {
+        if (result.frames.size() >= maximum_frames)
+            break;
+        if (!frame_value.is_object())
+            continue;
+        auto name = frame_value.as_object().get_string("navigable"sv);
+        auto navigable = name.has_value() ? hint_navigable_from_name(*name) : OptionalNone {};
+        if (!navigable.has_value())
+            continue;
+        result.frames.append({ *navigable, frame_value.as_object().get_bool("exposed"sv).value_or(false) });
+    }
+    return result;
+}
+
+HintList merge_hint_answers(Vector<HintAnswerFromProcess> const& answers, Vector<HintNavigable> const& navigables, Gfx::IntSize viewport, double device_pixels_per_css_pixel)
+{
+    HintList list;
+    if (navigables.is_empty())
+        return list;
+
+    HashMap<Web::HTML::CrossProcessId, size_t> index_of;
+    for (size_t index = 0; index < navigables.size(); ++index)
+        index_of.set(navigables[index].id, index);
+
+    // Only the process hosting the parent of a remote navigable says whether it shows it.
+    HashTable<size_t> exposed;
+    for (auto const& answer : answers) {
+        for (auto const& frame : answer.answer.frames) {
+            auto index = index_of.get(frame.navigable);
+            if (!index.has_value() || !navigables[*index].remote || !navigables[*index].parent.has_value())
+                continue;
+            if (frame.exposed && navigables[*navigables[*index].parent].host == answer.host)
+                exposed.set(*index);
+        }
+    }
+
+    // The local root that holds a navigable: the nearest inclusive ancestor that is the top-level traversable or remote.
+    auto local_root_of = [&](size_t index) {
+        while (index != 0 && !navigables[index].remote)
+            index = *navigables[index].parent;
+        return index;
+    };
+
+    struct Document {
+        size_t order { 0 };
+        size_t host { 0 };
+        size_t root { 0 };
+        HintRoot const* items;
+    };
+    Vector<Document> documents;
+    for (auto const& answer : answers) {
+        for (auto const& root : answer.answer.roots) {
+            auto index_or_top_level = [&](Optional<Web::HTML::CrossProcessId> const& id) -> Optional<size_t> {
+                if (!id.has_value())
+                    return 0;
+                return index_of.get(*id).copy();
+            };
+            auto root_index = index_or_top_level(root.navigable);
+            auto frame_index = index_or_top_level(root.frame);
+            if (!root_index.has_value() || !frame_index.has_value())
+                continue;
+            // The process hosts the document, and the local root named holds it.
+            if (navigables[*frame_index].host != answer.host || navigables[*root_index].host != answer.host || local_root_of(*frame_index) != *root_index)
+                continue;
+            if (*root_index != 0 && !navigables[*root_index].remote)
+                continue;
+            auto shown = true;
+            for (Optional<size_t> ancestor = *root_index; ancestor.has_value(); ancestor = navigables[*ancestor].parent) {
+                if (navigables[*ancestor].remote)
+                    shown &= exposed.contains(*ancestor);
+            }
+            if (shown)
+                documents.append({ *frame_index, answer.host, *root_index, &root });
+        }
+        list.truncated |= answer.answer.truncated;
+    }
+    quick_sort(documents, [](auto const& a, auto const& b) { return a.order < b.order; });
+
+    Gfx::IntRect top_level_viewport { {}, viewport };
+    for (auto const& document : documents) {
+        auto const& root = navigables[document.root];
+        for (auto const& item : document.items->items) {
+            auto rect = Gfx::DoubleRect { item.x, item.y, item.width, item.height };
+            if (document.root != 0)
+                rect.intersect(root.visible.to_type<double>());
+            rect.translate_by(root.local_root_offset.to_type<double>());
+            rect.intersect(top_level_viewport.to_type<double>());
+            if (rect.is_empty())
+                continue;
+            if (list.items.size() == maximum_hint_count) {
+                list.truncated = true;
+                return list;
+            }
+            auto listed = item;
+            listed.x = rect.x() / device_pixels_per_css_pixel;
+            listed.y = rect.y() / device_pixels_per_css_pixel;
+            listed.width = rect.width() / device_pixels_per_css_pixel;
+            listed.height = rect.height() / device_pixels_per_css_pixel;
+            list.items.append({ document.host, move(listed) });
+        }
+    }
+    return list;
 }
 
 }
