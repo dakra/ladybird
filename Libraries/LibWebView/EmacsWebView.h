@@ -43,7 +43,17 @@ public:
     // waiting for an answer, and a whole frame.
     void client_changed();
     void client_went_away();
+    // The client cannot map the segment of this view, or of another one: frames take the stream from now on.
     void client_cannot_use_shared_memory();
+    void client_stopped_using_shared_memory();
+
+    // The view was waiting for its turn to send a frame on the connection, and may ask again.
+    void did_get_turn_to_send() { schedule_frame_flush(); }
+    // The client has read some of what it was sent.
+    void connection_wrote() { send_held_messages(); }
+
+    // How many device pixels the viewport has.
+    i64 viewport_area() const { return static_cast<i64>(m_viewport_size.width().value()) * m_viewport_size.height().value(); }
 
     void did_block_download(StringView name);
 
@@ -140,10 +150,18 @@ private:
 
     JsonObject message(StringView type) const;
     void send(JsonObject const&);
+    // Sends a message that says only how something is now. The view has one batch of these on the connection at a
+    // time, and adds none while the connection is behind; meanwhile the latest of each type is held back.
+    void send_latest(JsonObject);
+    void send_held_messages();
     void send_error(StringView text);
 
     void schedule_state();
     void send_state();
+    void update_visibility();
+    // Ends a frame that was being sent in bands; the view's next frame is a whole one.
+    void stop_sending_frame();
+    void release_hidden_frame_buffers();
 
     void schedule_frame_flush();
     void flush_frame();
@@ -202,9 +220,15 @@ private:
     // Whether a client has been told of the view, in a welcome or a view_created message. Until then nothing about the
     // view is sent.
     bool m_client_knows_view { false };
+    // Whether the client wants the view shown, as it last said with set_visibility.
+    bool m_visible_to_client { true };
+    // Whether the view renders, which it does while it is visible to a client.
+    bool m_shown { false };
 
     bool m_state_scheduled { false };
     String m_last_sent_state;
+    Vector<JsonObject> m_held_messages;
+    u64 m_end_of_sent_latest_messages { 0 };
     String m_last_sent_input_method_state;
     Optional<Gfx::Color> m_last_sent_background_color;
 
@@ -229,11 +253,9 @@ private:
 
     String m_find_query;
     bool m_console_enabled { false };
-    u64 m_screenshots_taken { 0 };
     // The screenshot of the whole page that the page has been asked for.
     Optional<PendingScreenshot> m_pending_screenshot;
 
-    u64 m_next_request_id { 1 };
     Vector<OpenRequest> m_open_requests;
     // The request that the alert, confirmation or prompt the page waits in was asked with.
     Optional<u64> m_dialog_request_id;
@@ -247,58 +269,8 @@ private:
 
     Optional<HintSession> m_hint_session;
     u64 m_next_hint_session_serial { 1 };
-    u64 m_next_hint_request { 1 };
     HashMap<u64, HintActivation> m_hint_activations;
     HashMap<u64, HintClick> m_hint_clicks;
-};
-
-// The Emacs headless mode: one client at a time on a transport, and the view it shows, if any. The server keeps running,
-// and the view keeps its page, while no client is connected.
-class WEBVIEW_API EmacsServer {
-public:
-    AK_ALLOC_WITH_KMALLOC;
-
-    static ErrorOr<NonnullOwnPtr<EmacsServer>> create(Core::AnonymousBuffer theme, BrowserOptions const&);
-    ~EmacsServer();
-
-    // Whether a client has finished its handshake, so that it can be sent messages and frames.
-    bool has_ready_client() const { return m_transport->has_client() && m_client.hello_done; }
-    bool client_accepts_zstd() const { return m_client.accepts_zstd; }
-    bool client_uses_shared_memory() const { return m_client.uses_shared_memory; }
-
-    // A message that does not fit a record is dropped, which this reports.
-    bool send(JsonObject const&);
-    void send_record(ByteBuffer&&);
-    void send_error(Optional<u32> view, StringView text, JsonValue request = {});
-
-    // Pages save nothing in this mode, as the client is not asked where to. The client is told what was not saved.
-    static void did_block_download(StringView name);
-
-    void view_did_close(Badge<EmacsWebView>);
-
-private:
-    struct ClientState {
-        bool hello_done { false };
-        bool accepts_zstd { false };
-        bool uses_shared_memory { false };
-    };
-
-    EmacsServer(Core::AnonymousBuffer theme, NonnullOwnPtr<EmacsTransport>);
-
-    void handle_control(JsonObject const&);
-    void handle_hello(JsonObject const&);
-    void handle_create_view(JsonObject const&);
-    void handle_close_view(JsonObject const&);
-
-    EmacsWebView& create_view(Web::DevicePixelSize, double device_pixel_ratio);
-    void shut_down();
-
-    Core::AnonymousBuffer m_theme;
-    NonnullOwnPtr<EmacsTransport> m_transport;
-    OwnPtr<EmacsWebView> m_view;
-    u32 m_next_view_id { 1 };
-    ClientState m_client;
-    Vector<int> m_signal_handler_ids;
 };
 
 }

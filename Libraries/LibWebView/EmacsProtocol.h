@@ -18,6 +18,7 @@
 #include <LibGfx/Cursor.h>
 #include <LibGfx/Rect.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
+#include <LibWebCommon/PixelUnits.h>
 #include <LibWebCommon/UIEvents/KeyCode.h>
 #include <LibWebCommon/UIEvents/MouseButton.h>
 #include <LibWebView/Export.h>
@@ -46,6 +47,34 @@ enum class FrameEncoding : u8 {
 
 constexpr u8 frame_flag_full = 1 << 0;
 constexpr u8 frame_flag_more = 1 << 1;
+
+// The Compositor pads a backing store by 256 pixels each way while a view is resized, and a Metal texture is at most
+// 16384 pixels wide or high.
+constexpr int maximum_viewport_dimension = 16000;
+// A frame of this many pixels takes 256 MiB, of which the Compositor keeps three.
+constexpr i64 maximum_viewport_area = 64'000'000;
+// The viewports of all views of a server together have at most this many pixels, for which the Compositor keeps about
+// 3 GiB.
+constexpr i64 maximum_total_viewport_area = 4 * maximum_viewport_area;
+constexpr double minimum_device_pixel_ratio = 0.25;
+constexpr double maximum_device_pixel_ratio = 8.0;
+
+// Text that comes from a page is cut to this many bytes of UTF-8 before it goes into a control message, which keeps
+// every message well within a record.
+constexpr size_t maximum_text_bytes = 1 * MiB;
+
+// Text made fit for the wire: valid UTF-8, with a replacement character for what is not, of a bounded length.
+WEBVIEW_API String wire_text(StringView);
+
+struct Viewport {
+    Web::DevicePixelSize size;
+    double device_pixel_ratio { 1.0 };
+};
+
+// The viewport a message asks for (`width`, `height`, `dpr`), with what it leaves out from the fallback. The size is
+// brought within what the Compositor can allocate and within the area that is left; a device pixel ratio out of range
+// is refused, and so is any viewport when no area is left.
+WEBVIEW_API ErrorOr<Viewport> viewport_from(JsonObject const&, Viewport fallback, i64 area_left = maximum_viewport_area);
 
 struct FrameHeader {
     u32 seq { 0 };

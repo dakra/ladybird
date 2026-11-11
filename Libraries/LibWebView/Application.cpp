@@ -88,7 +88,7 @@
 #include <LibWebView/WorkerAgentManager.h>
 
 #if !defined(AK_OS_WINDOWS)
-#    include <LibWebView/EmacsWebView.h>
+#    include <LibWebView/EmacsServer.h>
 #    include <LibWebView/TerminalWebView.h>
 #endif
 
@@ -330,6 +330,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     Optional<double> device_pixel_ratio;
     Optional<StringView> emacs_socket_path;
     Optional<StringView> emacs_log_path;
+    Optional<size_t> emacs_maximum_views;
     Optional<u32> screenshot_delay;
     Optional<StringView> screenshot_path;
     bool new_window = false;
@@ -426,6 +427,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(device_pixel_ratio, "Set the device pixel ratio (default: 1) (only supported for headless terminal mode)", "device-pixel-ratio", 0, "ratio");
     args_parser.add_option(emacs_socket_path, "Serve the Emacs client on a Unix socket instead of stdio (only supported for headless emacs mode)", "emacs-socket", 0, "path");
     args_parser.add_option(emacs_log_path, "Write log output to the given file (only supported for headless emacs mode)", "emacs-log", 0, "path");
+    args_parser.add_option(emacs_maximum_views, "Serve at most this many views at a time, from 1 to 64 (default: 16) (only supported for headless emacs mode)", "emacs-max-views", 0, "count");
     args_parser.add_option(certificates, "Path to a certificate file", "certificate", 'C', "certificate");
     args_parser.add_option(Core::ArgsParser::Option {
         .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
@@ -629,6 +631,13 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         m_browser_options.emacs_socket_path = *emacs_socket_path;
     if (emacs_log_path.has_value())
         m_browser_options.emacs_log_path = *emacs_log_path;
+    if (emacs_maximum_views.has_value()) {
+#if !defined(AK_OS_WINDOWS)
+        if (*emacs_maximum_views < 1 || *emacs_maximum_views > EmacsServer::maximum_maximum_views)
+            return Error::from_string_literal("--emacs-max-views must be from 1 to 64");
+#endif
+        m_browser_options.emacs_maximum_views = *emacs_maximum_views;
+    }
 
 #if !defined(AK_OS_WINDOWS)
     if (headless_mode == HeadlessMode::Terminal)

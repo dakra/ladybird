@@ -10,6 +10,7 @@
 #include <AK/Math.h>
 #include <AK/StringBuilder.h>
 #include <LibTest/TestCase.h>
+#include <LibWebView/EmacsFrameTurns.h>
 #include <LibWebView/EmacsProtocol.h>
 
 using namespace WebView::EmacsProtocol;
@@ -536,4 +537,215 @@ TEST_CASE(hint_answers_are_cut_to_the_viewport_and_the_limit)
     EXPECT(list.truncated);
     EXPECT_EQ(list.items[0].item.node, 2);
     EXPECT_EQ(list.items[0].item.width, 5.0);
+}
+
+TEST_CASE(viewports_are_brought_within_limits)
+{
+    auto parse = [](StringView json) { return viewport_from(MUST(JsonValue::from_string(json)).as_object(), { { 800, 600 }, 1.0 }); };
+
+    auto fallback = MUST(parse("{}"sv));
+    EXPECT_EQ(fallback.size, Web::DevicePixelSize(800, 600));
+    EXPECT_EQ(fallback.device_pixel_ratio, 1.0);
+
+    auto given = MUST(parse("{\"width\":1600,\"height\":1000,\"dpr\":2}"sv));
+    EXPECT_EQ(given.size, Web::DevicePixelSize(1600, 1000));
+    EXPECT_EQ(given.device_pixel_ratio, 2.0);
+
+    EXPECT_EQ(MUST(parse("{\"width\":100000,\"height\":300}"sv)).size, Web::DevicePixelSize(maximum_viewport_dimension, 300));
+    EXPECT_EQ(MUST(parse("{\"width\":16000,\"height\":16000}"sv)).size, Web::DevicePixelSize(16000, 4000));
+    EXPECT_EQ(MUST(parse("{\"width\":-5,\"height\":0}"sv)).size, Web::DevicePixelSize(1, 1));
+    EXPECT_EQ(MUST(parse("{\"width\":\"wide\",\"height\":1e300}"sv)).size, Web::DevicePixelSize(800, maximum_viewport_dimension));
+
+    EXPECT(parse("{\"dpr\":0}"sv).is_error());
+    EXPECT(parse("{\"dpr\":8.5}"sv).is_error());
+    EXPECT(parse("{\"dpr\":\"2\"}"sv).is_error());
+    EXPECT(parse("{\"dpr\":null}"sv).is_error());
+    EXPECT_EQ(MUST(parse("{\"dpr\":0.25}"sv)).device_pixel_ratio, 0.25);
+}
+
+TEST_CASE(viewports_share_an_area)
+{
+    auto parse = [](StringView json, i64 area_left) {
+        return viewport_from(MUST(JsonValue::from_string(json)).as_object(), { { 800, 600 }, 1.0 }, area_left);
+    };
+
+    EXPECT_EQ(maximum_total_viewport_area, 4 * maximum_viewport_area);
+    EXPECT_EQ(MUST(parse("{\"width\":1000,\"height\":1000}"sv, maximum_total_viewport_area)).size, Web::DevicePixelSize(1000, 1000));
+    EXPECT_EQ(MUST(parse("{\"width\":16000,\"height\":16000}"sv, maximum_total_viewport_area)).size, Web::DevicePixelSize(16000, 4000));
+    EXPECT_EQ(MUST(parse("{\"width\":1000,\"height\":1000}"sv, 500'000)).size, Web::DevicePixelSize(1000, 500));
+    EXPECT_EQ(MUST(parse("{\"width\":1000,\"height\":1000}"sv, 10)).size, Web::DevicePixelSize(10, 1));
+    EXPECT_EQ(MUST(parse("{}"sv, 1)).size, Web::DevicePixelSize(1, 1));
+    EXPECT(parse("{}"sv, 0).is_error());
+    EXPECT(parse("{}"sv, -5).is_error());
+}
+
+namespace {
+
+struct Turns {
+    explicit Turns(size_t budget = 100)
+        : turns(budget)
+    {
+        turns.on_turn = [this](u32 view) { told.append(view); };
+    }
+
+    Vector<u32> take_told() { return move(told); }
+
+    WebView::EmacsFrameTurns turns;
+    Vector<u32> told;
+};
+
+}
+
+TEST_CASE(frame_turns_are_given_in_the_order_views_wait)
+{
+    Turns t;
+    EXPECT(t.turns.begin_turn(1, 0));
+    t.turns.end_turn(1, false);
+    EXPECT(t.turns.begin_turn(2, 0));
+    t.turns.end_turn(2, false);
+
+    // Over the budget, every view waits, in the order it asked.
+    EXPECT(!t.turns.begin_turn(3, 100));
+    EXPECT(!t.turns.begin_turn(1, 100));
+    EXPECT(!t.turns.begin_turn(3, 100));
+    EXPECT_EQ(t.turns.waiting_views(), (Vector<u32> { 3, 1 }));
+
+    // Below it, the longest waiting goes first, and the others are told to ask again once it is done.
+    t.turns.connection_wrote(150);
+    EXPECT(t.take_told().is_empty());
+    t.turns.connection_wrote(99);
+    EXPECT_EQ(t.take_told(), (Vector<u32> { 3, 1 }));
+    EXPECT(!t.turns.begin_turn(1, 0));
+    EXPECT(t.turns.begin_turn(3, 0));
+    EXPECT_EQ(t.turns.waiting_views(), (Vector<u32> { 1 }));
+    t.turns.end_turn(3, false);
+    EXPECT_EQ(t.take_told(), (Vector<u32> { 1 }));
+    EXPECT(t.turns.begin_turn(1, 0));
+    t.turns.end_turn(1, false);
+    EXPECT(t.turns.waiting_views().is_empty());
+}
+
+TEST_CASE(frame_turns_are_handed_on_however_they_end)
+{
+    Turns t;
+    EXPECT(!t.turns.begin_turn(1, 100));
+    EXPECT(!t.turns.begin_turn(2, 100));
+    t.turns.connection_wrote(0);
+    t.take_told();
+
+    // A view that had its turn and sent nothing, as its frame was empty or did not encode, hands it on.
+    EXPECT(t.turns.begin_turn(1, 0));
+    t.turns.end_turn(1, false);
+    EXPECT_EQ(t.take_told(), (Vector<u32> { 2 }));
+
+    // A view at the head of the queue that has nothing to send any more hands it on too.
+    EXPECT(!t.turns.begin_turn(3, 100));
+    EXPECT(!t.turns.begin_turn(4, 100));
+    EXPECT_EQ(t.turns.waiting_views(), (Vector<u32> { 2, 3, 4 }));
+    t.turns.stop_waiting(3);
+    EXPECT(t.take_told().is_empty());
+    t.turns.stop_waiting(2);
+    EXPECT_EQ(t.take_told(), (Vector<u32> { 4 }));
+    t.turns.stop_waiting(7);
+    EXPECT(t.take_told().is_empty());
+
+    // A turn that was not ended is, when the next one begins.
+    EXPECT(t.turns.begin_turn(4, 0));
+    EXPECT(t.turns.begin_turn(5, 0));
+    t.turns.end_turn(5, false);
+}
+
+TEST_CASE(frame_turns_keep_bands_together)
+{
+    Turns t;
+    EXPECT(t.turns.begin_turn(1, 0));
+    t.turns.end_turn(1, true);
+    EXPECT_EQ(t.turns.view_sending_bands(), 1u);
+    EXPECT(t.take_told().is_empty());
+
+    // Others wait until the frame is over, even with room on the connection.
+    EXPECT(!t.turns.begin_turn(2, 0));
+    EXPECT(!t.turns.begin_turn(3, 0));
+    t.turns.connection_wrote(0);
+    EXPECT(t.take_told().is_empty());
+
+    // The view sending bands goes on, but not beyond the budget either.
+    EXPECT(!t.turns.begin_turn(1, 100));
+    EXPECT_EQ(t.turns.waiting_views(), (Vector<u32> { 2, 3, 1 }));
+    t.turns.connection_wrote(10);
+    EXPECT_EQ(t.take_told(), (Vector<u32> { 1 }));
+    EXPECT(t.turns.begin_turn(1, 10));
+    t.turns.end_turn(1, true);
+    EXPECT(t.turns.begin_turn(1, 10));
+    t.turns.end_turn(1, false);
+    EXPECT(!t.turns.view_sending_bands().has_value());
+    EXPECT_EQ(t.take_told(), (Vector<u32> { 2, 3 }));
+    EXPECT(t.turns.begin_turn(2, 0));
+    t.turns.end_turn(2, false);
+}
+
+TEST_CASE(frame_turns_go_on_without_a_view_that_stops_sending)
+{
+    // Hidden, closed, or crashed between the bands of its frame.
+    Turns t;
+    EXPECT(t.turns.begin_turn(1, 0));
+    t.turns.end_turn(1, true);
+    EXPECT(!t.turns.begin_turn(2, 0));
+    t.turns.stop_sending(1);
+    EXPECT(!t.turns.view_sending_bands().has_value());
+    EXPECT_EQ(t.take_told(), (Vector<u32> { 2 }));
+    EXPECT(t.turns.begin_turn(2, 0));
+    t.turns.end_turn(2, false);
+
+    // Waiting, while the bands of another frame go out.
+    EXPECT(t.turns.begin_turn(3, 0));
+    t.turns.end_turn(3, true);
+    EXPECT(!t.turns.begin_turn(1, 0));
+    EXPECT(!t.turns.begin_turn(2, 0));
+    t.turns.stop_sending(1);
+    EXPECT_EQ(t.turns.waiting_views(), (Vector<u32> { 2 }));
+    EXPECT(t.take_told().is_empty());
+    t.turns.stop_sending(3);
+    EXPECT_EQ(t.take_told(), (Vector<u32> { 2 }));
+
+    // Waiting at the head of the queue.
+    EXPECT(!t.turns.begin_turn(4, 100));
+    EXPECT_EQ(t.turns.waiting_views(), (Vector<u32> { 2, 4 }));
+    t.take_told();
+    t.turns.stop_sending(2);
+    EXPECT_EQ(t.take_told(), (Vector<u32> { 4 }));
+    EXPECT(t.turns.begin_turn(4, 0));
+    t.turns.end_turn(4, false);
+}
+
+TEST_CASE(frame_turns_start_over_with_a_new_client)
+{
+    Turns t;
+    EXPECT(t.turns.begin_turn(1, 0));
+    t.turns.end_turn(1, true);
+    EXPECT(!t.turns.begin_turn(2, 0));
+    t.turns.reset();
+    EXPECT(!t.turns.view_sending_bands().has_value());
+    EXPECT(t.turns.waiting_views().is_empty());
+    EXPECT(t.turns.begin_turn(2, 0));
+    t.turns.end_turn(2, false);
+    EXPECT(t.turns.begin_turn(1, 0));
+    t.turns.end_turn(1, false);
+}
+
+TEST_CASE(wire_text_is_valid_and_bounded)
+{
+    EXPECT_EQ(wire_text("héllo"sv), "héllo"_string);
+    EXPECT_EQ(wire_text("a\xff"
+                        "b"sv),
+        "a�b"_string);
+
+    auto long_text = MUST(String::repeated('a', maximum_text_bytes + 10));
+    EXPECT_EQ(wire_text(long_text).byte_count(), maximum_text_bytes);
+
+    // A multi-byte character that does not fit whole is left out.
+    StringBuilder builder;
+    builder.append(MUST(String::repeated('a', maximum_text_bytes - 1)));
+    builder.append("é"sv);
+    EXPECT_EQ(wire_text(builder.string_view()).byte_count(), maximum_text_bytes - 1);
 }

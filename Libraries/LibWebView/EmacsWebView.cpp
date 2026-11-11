@@ -10,6 +10,7 @@
 #include <AK/JsonArray.h>
 #include <AK/JsonValue.h>
 #include <AK/QuickSort.h>
+#include <AK/ScopeGuard.h>
 #include <AK/String.h>
 #include <AK/StringBuilder.h>
 #include <AK/Time.h>
@@ -29,6 +30,7 @@
 #include <LibWebView/CanonicalNavigable.h>
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/EmacsProtocol.h>
+#include <LibWebView/EmacsServer.h>
 #include <LibWebView/EmacsWebView.h>
 #include <LibWebView/PageBackingStores.h>
 #include <LibWebView/URL.h>
@@ -53,36 +55,25 @@ static constexpr size_t maximum_pixel_bytes_per_record = EmacsProtocol::maximum_
 // A smaller rectangle than this is sent as it is, since compressing it saves little.
 static constexpr size_t minimum_pixel_bytes_to_compress = 16 * KiB;
 
-// The Compositor pads a backing store by 256 pixels each way while a view is resized, and a Metal texture is at most
-// 16384 pixels wide or high.
-static constexpr int maximum_viewport_dimension = 16000;
-// A frame of this many pixels takes 256 MiB, of which the Compositor keeps three.
-static constexpr i64 maximum_viewport_area = 64'000'000;
-static constexpr double minimum_device_pixel_ratio = 0.25;
-static constexpr double maximum_device_pixel_ratio = 8.0;
+using EmacsProtocol::maximum_device_pixel_ratio;
+using EmacsProtocol::maximum_text_bytes;
+using EmacsProtocol::maximum_viewport_area;
+using EmacsProtocol::maximum_viewport_dimension;
+using EmacsProtocol::minimum_device_pixel_ratio;
+using EmacsProtocol::Viewport;
+using EmacsProtocol::viewport_from;
 
 static constexpr double maximum_wheel_delta = 1'000'000;
 static constexpr int maximum_history_delta = 10'000;
 
-// Text that comes from a page is cut to this many bytes of UTF-8 before it goes into a control message, which keeps
-// every message well within a record.
-static constexpr size_t maximum_text_bytes = 1 * MiB;
 static constexpr size_t maximum_favicon_bytes = 1 * MiB;
 
 static constexpr auto popup_url_timeout = AK::Duration::from_seconds(2);
 
-static EmacsServer* s_the_server;
-
 // These make text fit for the wire: valid UTF-8, with a replacement character for what is not, of a bounded length.
 static String wire_text(StringView text)
 {
-    if (text.length() > maximum_text_bytes) {
-        auto length = maximum_text_bytes;
-        while (length > 0 && (static_cast<u8>(text[length]) & 0xc0) == 0x80)
-            --length;
-        text = text.substring_view(0, length);
-    }
-    return String::from_utf8_with_replacement_character(text, String::WithBOMHandling::No);
+    return EmacsProtocol::wire_text(text);
 }
 
 static String wire_text(String const& text)
@@ -155,28 +146,6 @@ static JsonValue echoed(JsonObject const& object, StringView key)
     return JsonValue {};
 }
 
-struct Viewport {
-    Web::DevicePixelSize size;
-    double device_pixel_ratio { 1.0 };
-};
-
-// The size is brought within what the Compositor can allocate. A device pixel ratio out of range is refused.
-static ErrorOr<Viewport> viewport_from(JsonObject const& object, Viewport fallback)
-{
-    auto device_pixel_ratio = fallback.device_pixel_ratio;
-    if (object.has("dpr"sv)) {
-        auto requested = number(object, "dpr"sv);
-        if (!requested.has_value() || !isfinite(*requested) || *requested < minimum_device_pixel_ratio || *requested > maximum_device_pixel_ratio)
-            return Error::from_string_literal("dpr must be a number from 0.25 to 8");
-        device_pixel_ratio = *requested;
-    }
-
-    auto width = clamp(integer(object, "width"sv, fallback.size.width().value()), 1, maximum_viewport_dimension);
-    auto height = clamp(integer(object, "height"sv, fallback.size.height().value()), 1, maximum_viewport_dimension);
-    height = min(height, static_cast<int>(maximum_viewport_area / width));
-    return Viewport { { width, height }, device_pixel_ratio };
-}
-
 // Writes a file that only this user reads. Without a path, the file gets a name in /tmp, where anyone can put a file or
 // a link at a name, so that one is a file this process creates.
 static ErrorOr<ByteString> write_private_file(Optional<ByteString> const& path, StringView default_name, ReadonlyBytes contents)
@@ -201,7 +170,8 @@ static ErrorOr<ByteString> write_private_file(Optional<ByteString> const& path, 
 NonnullOwnPtr<EmacsWebView> EmacsWebView::create(Core::AnonymousBuffer theme, Web::DevicePixelSize viewport_size, double device_pixel_ratio, EmacsServer& server, u32 id)
 {
     auto view = adopt_own(*new EmacsWebView(move(theme), viewport_size, device_pixel_ratio, server, id));
-    view->initialize_tab(Web::HTML::VisibilityState::Visible);
+    // NB: A view renders only while a client is there to see it.
+    view->initialize_tab(Web::HTML::VisibilityState::Hidden);
     view->set_presents_from_cpu_memory(true);
     return view;
 }
@@ -220,29 +190,29 @@ EmacsWebView::EmacsWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize vie
     on_cursor_change = [this](Gfx::Cursor const& cursor) {
         auto cursor_message = message("cursor"sv);
         cursor_message.set("cursor"sv, EmacsProtocol::css_cursor_name(cursor));
-        send(cursor_message);
+        send_latest(move(cursor_message));
     };
 
     on_link_hover = [this](URL::URL const& url) {
         auto hover = message("link_hover"sv);
         hover.set("url"sv, wire_text(url));
-        send(hover);
+        send_latest(move(hover));
     };
     on_link_unhover = [this] {
         auto hover = message("link_hover"sv);
         hover.set("url"sv, JsonValue {});
-        send(hover);
+        send_latest(move(hover));
     };
 
     on_enter_tooltip_area = [this](ByteString const& text) {
         auto tooltip = message("tooltip"sv);
         tooltip.set("text"sv, wire_text(text));
-        send(tooltip);
+        send_latest(move(tooltip));
     };
     on_leave_tooltip_area = [this] {
         auto tooltip = message("tooltip"sv);
         tooltip.set("text"sv, JsonValue {});
-        send(tooltip);
+        send_latest(move(tooltip));
     };
 
     on_favicon_change = [this](Optional<Gfx::Bitmap const&> bitmap) {
@@ -251,12 +221,12 @@ EmacsWebView::EmacsWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize vie
         if (bitmap.has_value()) {
             auto png = Gfx::PNGWriter::encode(*bitmap);
             if (png.is_error() || png.value().size() > maximum_favicon_bytes) {
-                dbgln("Emacs: not sending a favicon that cannot be encoded or is too large");
+                dbgln("Emacs: view {}: not sending a favicon that cannot be encoded or is too large", m_id);
             } else if (auto base64 = encode_base64(png.value()); !base64.is_error()) {
                 favicon.set("png"sv, base64.release_value());
             }
         }
-        send(favicon);
+        send_latest(move(favicon));
     };
 
     on_page_background_color_change = [this](Gfx::Color color) {
@@ -265,7 +235,7 @@ EmacsWebView::EmacsWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize vie
         m_last_sent_background_color = color;
         auto background = message("background_color"sv);
         background.set("rgb"sv, wire_formatted("#{:02x}{:02x}{:02x}", color.red(), color.green(), color.blue()));
-        send(background);
+        send_latest(move(background));
     };
 
     on_find_in_page = [this](size_t current_match_index, Optional<size_t> const& total_match_count) {
@@ -369,7 +339,7 @@ EmacsWebView::EmacsWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize vie
         auto crashed = message("crashed"sv);
         crashed.set("reason"sv, reason == WebContentCrashReason::RejectedIPC ? "rejected_ipc"sv : "process_crash"sv);
         send(crashed);
-        m_frame_needs_full = true;
+        stop_sending_frame();
     };
 
     on_top_level_navigation_commit = [this] {
@@ -390,7 +360,7 @@ EmacsWebView::EmacsWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize vie
         auto closed = message("view_closed"sv);
         closed.set("reason"sv, "closed"sv);
         send(closed);
-        m_server.view_did_close({});
+        m_server.view_did_close({}, m_id);
     };
 
     on_hints_collected = [this](WebContentPage& page, u64 request_id, JsonValue const& result) {
@@ -624,6 +594,26 @@ void EmacsWebView::send(JsonObject const& object)
         m_server.send(object);
 }
 
+void EmacsWebView::send_latest(JsonObject message)
+{
+    if (!m_client_knows_view)
+        return;
+    auto type = message.get_string("type"sv).value();
+    m_held_messages.remove_first_matching([&](auto const& held) { return held.get_string("type"sv) == type; });
+    m_held_messages.append(move(message));
+    send_held_messages();
+}
+
+void EmacsWebView::send_held_messages()
+{
+    if (m_held_messages.is_empty() || m_server.connection_is_behind() || !m_server.client_has_read(m_end_of_sent_latest_messages))
+        return;
+    auto held_messages = move(m_held_messages);
+    for (auto const& message : held_messages)
+        send(message);
+    m_end_of_sent_latest_messages = m_server.end_of_stream();
+}
+
 void EmacsWebView::did_block_download(StringView name)
 {
     send_error(wire_formatted("download blocked: {}", name));
@@ -689,7 +679,7 @@ void EmacsWebView::send_state()
     if (serialized == m_last_sent_state)
         return;
     m_last_sent_state = move(serialized);
-    send(state);
+    send_latest(move(state));
 }
 
 void EmacsWebView::client_went_away()
@@ -697,18 +687,66 @@ void EmacsWebView::client_went_away()
     // The labels were for the client that asked for them.
     end_hint_session(HintSessionEnd::Silently);
     m_client_knows_view = false;
+    m_held_messages.clear();
+    m_end_of_sent_latest_messages = 0;
     m_frame_in_flight = false;
     m_frame_needs_full = true;
     m_remaining_bands.clear();
     m_shared_frame_buffer = nullptr;
     m_retired_shared_frame_buffer = nullptr;
     m_held_mouse_buttons = MouseButton::None;
+    update_visibility();
+}
+
+// A view is visible while a client knows it and has not hidden it. Without a client, nobody sees a page, so none
+// renders; the visibility the last client chose comes back for the next one.
+void EmacsWebView::update_visibility()
+{
+    auto visible = m_client_knows_view && m_visible_to_client;
+    if (visible == m_shown)
+        return;
+    m_shown = visible;
+    set_system_visibility_state(visible ? Web::HTML::VisibilityState::Visible : Web::HTML::VisibilityState::Hidden);
+    if (visible) {
+        m_frame_needs_full = true;
+        schedule_frame_flush();
+    } else {
+        stop_sending_frame();
+        release_hidden_frame_buffers();
+    }
+}
+
+void EmacsWebView::stop_sending_frame()
+{
+    m_remaining_bands.clear();
+    m_frame_needs_full = true;
+    m_server.stop_sending_frames(*this);
+}
+
+// A hidden view needs no segment and no pixels to compress until it is shown, when it sends a whole frame anyway. The
+// segment goes once the client is done with the frame in it.
+void EmacsWebView::release_hidden_frame_buffers()
+{
+    if (m_shown || m_frame_in_flight)
+        return;
+    m_shared_frame_buffer = nullptr;
+    m_retired_shared_frame_buffer = nullptr;
+    m_frame_encoder.release_scratch();
+}
+
+void EmacsWebView::client_stopped_using_shared_memory()
+{
+    m_shared_frame_buffer = nullptr;
+    m_retired_shared_frame_buffer = nullptr;
+    m_frame_needs_full = true;
+    schedule_frame_flush();
 }
 
 void EmacsWebView::client_changed()
 {
     client_went_away();
     m_client_knows_view = true;
+    update_visibility();
     m_last_sent_state = {};
     m_last_sent_background_color.clear();
     m_last_sent_input_method_state = {};
@@ -753,22 +791,34 @@ void EmacsWebView::schedule_frame_flush()
 
 void EmacsWebView::flush_frame()
 {
-    // The client has one frame record at a time. What changes meanwhile is sent once it has acknowledged that.
-    if (!m_client_knows_view || m_frame_in_flight)
+    // The client has one frame record at a time. What changes meanwhile is sent once it has acknowledged that. A view the
+    // client has hidden sends nothing.
+    auto has_frame_to_send = m_frame_needs_full || m_remaining_bands.has_value() || m_pending_damage.has_value();
+    if (!m_client_knows_view || !m_visible_to_client || m_frame_in_flight || !has_frame_to_send) {
+        m_server.stop_waiting_for_frame_turn(*this);
         return;
+    }
 
     auto frame = backing_stores().displayed_frame();
-    if (!frame.has_value() || !frame->shared_image_buffer)
+    auto bitmap = frame.has_value() && frame->shared_image_buffer ? frame->shared_image_buffer->bitmap_if_present() : nullptr;
+    if (!bitmap) {
+        // The frame is sent once it is presented.
+        m_server.stop_waiting_for_frame_turn(*this);
         return;
-    auto bitmap = frame->shared_image_buffer->bitmap_if_present();
-    if (!bitmap)
+    }
+
+    // NB: The views share the connection; this one may have to wait for its turn, and is told when it has it.
+    if (!m_server.begin_frame_turn(*this))
         return;
+    ScopeGuard end_turn = [&] {
+        m_server.end_frame_turn(*this, m_remaining_bands.has_value());
+    };
 
     // NB: A backing store can be larger than the frame presented in it.
     Gfx::IntSize frame_size { min(frame->size.width(), bitmap->width()), min(frame->size.height(), bitmap->height()) };
     if (auto result = send_frame(*bitmap, frame_size, frame->device_pixel_ratio); result.is_error()) {
         // What the frame would have shown is sent with the next one, whole.
-        dbgln("Emacs: cannot send a frame: {}", result.error());
+        dbgln("Emacs: view {}: cannot send a frame: {}", m_id, result.error());
         m_frame_needs_full = true;
         m_remaining_bands.clear();
     }
@@ -838,7 +888,7 @@ ErrorOr<void> EmacsWebView::send_frame(Gfx::Bitmap const& bitmap, Gfx::IntSize f
     if (m_server.client_uses_shared_memory()) {
         auto announced_new_segment = write_frame_to_shared_memory(bitmap, frame_size, rect, (flags & EmacsProtocol::frame_flag_full) != 0);
         if (announced_new_segment.is_error()) {
-            dbgln("Emacs: cannot share a frame in memory: {}", announced_new_segment.error());
+            dbgln("Emacs: view {}: cannot share a frame in memory: {}", m_id, announced_new_segment.error());
         } else {
             encoding = EmacsProtocol::FrameEncoding::Shm;
             m_remaining_bands.clear();
@@ -906,7 +956,7 @@ ErrorOr<void> EmacsWebView::send_frame(Gfx::Bitmap const& bitmap, Gfx::IntSize f
     // Whole frames are rare, and their cost is what a slow connection or a large view shows first.
     if (flags & EmacsProtocol::frame_flag_full) {
         static constexpr Array encoding_names = { "raw"sv, "zstd"sv, "shm"sv };
-        dbgln("Emacs: whole frame {}x{}@{} as {}: {} bytes in {} ms", frame_size.width(), frame_size.height(), device_pixel_ratio, encoding_names[to_underlying(encoding)], record.size(), (MonotonicTime::now() - encoding_started).to_milliseconds());
+        dbgln("Emacs: view {}: whole frame {}x{}@{} as {}: {} bytes in {} ms", m_id, frame_size.width(), frame_size.height(), device_pixel_ratio, encoding_names[to_underlying(encoding)], record.size(), (MonotonicTime::now() - encoding_started).to_milliseconds());
     }
 
     ++m_frame_seq;
@@ -924,13 +974,14 @@ void EmacsWebView::handle_frame_ack(JsonObject const& ack)
 
     m_frame_in_flight = false;
     m_retired_shared_frame_buffer = nullptr;
+    release_hidden_frame_buffers();
     if (m_frame_needs_full || m_remaining_bands.has_value() || m_pending_damage.has_value())
         schedule_frame_flush();
 }
 
 void EmacsWebView::set_viewport(JsonObject const& object)
 {
-    auto viewport = viewport_from(object, { m_viewport_size, m_device_pixel_ratio });
+    auto viewport = viewport_from(object, { m_viewport_size, m_device_pixel_ratio }, m_server.viewport_area_left_for(this));
     if (viewport.is_error()) {
         send_error(viewport.error().string_literal());
         return;
@@ -954,10 +1005,8 @@ void EmacsWebView::handle_message(StringView type, JsonObject const& object)
     } else if (type == "set_viewport"sv) {
         set_viewport(object);
     } else if (type == "set_visibility"sv) {
-        auto visible = object.get_bool("visible"sv).value_or(true);
-        set_system_visibility_state(visible ? Web::HTML::VisibilityState::Visible : Web::HTML::VisibilityState::Hidden);
-        if (visible)
-            schedule_frame_flush();
+        m_visible_to_client = object.get_bool("visible"sv).value_or(true);
+        update_visibility();
     } else if (type == "set_focus"sv) {
         set_has_system_focus(object.get_bool("focused"sv).value_or(true));
     } else if (type == "load"sv) {
@@ -1126,7 +1175,7 @@ void EmacsWebView::handle_key(JsonObject const& object)
         if (auto key_code = EmacsProtocol::key_code_from_name(*name); key_code.has_value())
             key = *key_code;
         else
-            dbgln("Emacs: unknown key name '{}'", *name);
+            dbgln("Emacs: view {}: unknown key name '{}'", m_id, *name);
     }
 
     u32 code_point = 0;
@@ -1297,7 +1346,7 @@ void EmacsWebView::save_screenshot(PendingScreenshot const& screenshot, Gfx::Bit
         auto png = TRY(Gfx::PNGWriter::encode(bitmap));
         ByteString default_name;
         if (!screenshot.path.has_value())
-            default_name = ByteString::formatted("ladybird-emacs-{}-screenshot-{}.png", getpid(), ++m_screenshots_taken);
+            default_name = ByteString::formatted("ladybird-emacs-{}-screenshot-{}.png", getpid(), m_server.next_screenshot_number());
         return write_private_file(screenshot.path, default_name, png);
     };
 
@@ -1352,14 +1401,14 @@ void EmacsWebView::handle_hints(JsonObject const& object)
     auto timeout = Core::Timer::create_single_shot(hint_answer_timeout, [weak_this = make_weak_ptr<EmacsWebView>(), serial] {
         if (!weak_this || !weak_this->m_hint_session.has_value() || weak_this->m_hint_session->serial != serial || weak_this->m_hint_session->listed)
             return;
-        dbgln("Emacs: a page did not answer a hints request in time");
+        dbgln("Emacs: view {}: a page did not answer a hints request in time", weak_this->m_id);
         weak_this->end_hint_session(HintSessionEnd::Cancelled);
     });
     m_hint_session = HintSession {
         .serial = serial,
         .id = *id,
         .alphabet = *alphabet,
-        .collection_request = m_next_hint_request++,
+        .collection_request = m_server.next_request_id(),
         .pages = {},
         .pages_to_answer = {},
         .answers = {},
@@ -1401,7 +1450,7 @@ void EmacsWebView::did_collect_hints(WebContentPage& page, u64 request_id, JsonV
 
     auto host = session.pages.find_first_index_if([&](auto const& asked) { return asked.ptr() == &page; });
     if (auto answer = EmacsProtocol::parse_hint_answer(result); answer.is_error())
-        dbgln("Emacs: a page answered a hints request with something unusable: {}", answer.error());
+        dbgln("Emacs: view {}: a page answered a hints request with something unusable: {}", m_id, answer.error());
     else
         session.answers.append({ *host, answer.release_value() });
 
@@ -1414,7 +1463,7 @@ void EmacsWebView::did_collect_hints(WebContentPage& page, u64 request_id, JsonV
     session.grace = Core::Timer::create_single_shot(hint_answer_grace, [weak_this = make_weak_ptr<EmacsWebView>(), serial = session.serial] {
         if (!weak_this || !weak_this->m_hint_session.has_value() || weak_this->m_hint_session->serial != serial || weak_this->m_hint_session->listed)
             return;
-        dbgln("Emacs: listing hints without {} page(s) that did not answer", weak_this->m_hint_session->pages_to_answer.size());
+        dbgln("Emacs: view {}: listing hints without {} page(s) that did not answer", weak_this->m_id, weak_this->m_hint_session->pages_to_answer.size());
         weak_this->list_hints();
     });
     session.grace->start();
@@ -1567,7 +1616,7 @@ void EmacsWebView::end_hint_session(HintSessionEnd how, Optional<size_t> activat
     if (activate.has_value()) {
         auto& target = session.targets[*activate];
         if (target.page->is_open()) {
-            auto request = m_next_hint_request++;
+            auto request = m_server.next_request_id();
             auto now = MonotonicTime::now();
             m_hint_activations.remove_all_matching([&](auto const&, auto const& activation) { return activation.deadline < now; });
             m_hint_activations.set(request, { session.id, target.page, target.node, now + hint_answer_timeout });
@@ -1699,14 +1748,14 @@ Optional<u64> EmacsWebView::open_request(RequestKind kind, JsonObject request)
     static constexpr Array type_names = { "dialog"sv, "select"sv, "file_picker"sv, "color_picker"sv, "date_picker"sv, "permission"sv, "external_url"sv };
     auto type = type_names[to_underlying(kind)];
 
-    auto id = m_next_request_id++;
+    auto id = m_server.next_request_id();
     request.set("type"sv, type);
     request.set("view"sv, m_id);
     request.set("id"sv, id);
 
     // What the client cannot be asked, the page is not left waiting for.
     if (EmacsProtocol::encode_control_record(request).is_error()) {
-        dbgln("Emacs: a {} request does not fit a record", type);
+        dbgln("Emacs: view {}: a {} request does not fit a record", m_id, type);
         send_error(wire_formatted("a {} request of the page does not fit a record", type));
         return {};
     }
@@ -2012,324 +2061,6 @@ void EmacsWebView::report_blocked_popup(u64 popup_view_id, Optional<URL::URL> co
         if (weak_this)
             weak_this->close_child_web_views();
     });
-}
-
-ErrorOr<NonnullOwnPtr<EmacsServer>> EmacsServer::create(Core::AnonymousBuffer theme, BrowserOptions const& options)
-{
-    auto kind = options.emacs_socket_path.has_value() ? EmacsTransport::Kind::Socket : EmacsTransport::Kind::Stdio;
-    auto transport = TRY(EmacsTransport::create(kind, options.emacs_socket_path));
-    auto server = adopt_own(*new EmacsServer(move(theme), move(transport)));
-
-    // NB: Without a URL on the command line, the options hold the new tab page.
-    if (!options.raw_urls.is_empty() && !options.urls.is_empty()) {
-        auto width = clamp(options.window_width, 1, maximum_viewport_dimension);
-        auto height = min(clamp(options.window_height, 1, maximum_viewport_dimension), static_cast<int>(maximum_viewport_area / width));
-        auto device_pixel_ratio = clamp(options.device_pixel_ratio, minimum_device_pixel_ratio, maximum_device_pixel_ratio);
-        auto& view = server->create_view({ width, height }, device_pixel_ratio);
-        view.load_from_browser_ui(options.urls.first());
-    }
-    return server;
-}
-
-static bool signal_is_ignored(int signal_number)
-{
-    struct sigaction action {};
-    return ::sigaction(signal_number, nullptr, &action) == 0 && action.sa_handler == SIG_IGN;
-}
-
-EmacsServer::EmacsServer(Core::AnonymousBuffer theme, NonnullOwnPtr<EmacsTransport> transport)
-    : m_theme(move(theme))
-    , m_transport(move(transport))
-{
-    s_the_server = this;
-
-    m_transport->on_validate_hello = [](JsonObject const& hello) -> Optional<String> {
-        if (hello.get_u32("protocol"sv) != EmacsProtocol::protocol_version)
-            return "unsupported protocol version"_string;
-        return {};
-    };
-
-    m_transport->on_client_connected = [this] {
-        m_client = {};
-        if (m_view)
-            m_view->client_went_away();
-    };
-
-    m_transport->on_control = [this](JsonObject const& message) {
-        handle_control(message);
-    };
-
-    m_transport->on_client_disconnected = [this] {
-        dbgln("Emacs: client disconnected");
-        m_client = {};
-        if (m_view)
-            m_view->client_went_away();
-        // Nothing can connect to the standard streams again.
-        if (m_transport->kind() == EmacsTransport::Kind::Stdio)
-            shut_down();
-    };
-
-    for (auto signal_number : { SIGINT, SIGTERM, SIGHUP }) {
-        // A server started under nohup outlives its terminal.
-        if (signal_number == SIGHUP && signal_is_ignored(SIGHUP))
-            continue;
-        m_signal_handler_ids.append(Core::EventLoop::register_signal(signal_number, [this](int) {
-            shut_down();
-        }));
-    }
-}
-
-EmacsServer::~EmacsServer()
-{
-    for (auto id : m_signal_handler_ids)
-        Core::EventLoop::unregister_signal(id);
-    m_view = nullptr;
-    m_transport->shutdown();
-    s_the_server = nullptr;
-}
-
-void EmacsServer::did_block_download(StringView name)
-{
-    dbgln("Emacs: blocked the download of '{}'", name);
-    if (!s_the_server)
-        return;
-    if (s_the_server->m_view)
-        s_the_server->m_view->did_block_download(name);
-    else
-        s_the_server->send_error({}, wire_formatted("download blocked: {}", name));
-}
-
-void EmacsServer::shut_down()
-{
-    // The socket and the shared memory go now, in case the rest of the process does not get to exit in order.
-    m_transport->shutdown();
-    if (m_view)
-        m_view->client_went_away();
-    Core::EventLoop::current().quit(0);
-}
-
-bool EmacsServer::send(JsonObject const& message)
-{
-    auto record = EmacsProtocol::encode_control_record(message);
-    if (record.is_error()) {
-        dbgln("Emacs: dropping a '{}' message that does not fit a record", message.get_string("type"sv).value_or({}));
-        return false;
-    }
-    send_record(record.release_value());
-    return true;
-}
-
-void EmacsServer::send_record(ByteBuffer&& record)
-{
-    if (has_ready_client())
-        m_transport->send_record(move(record));
-}
-
-void EmacsServer::send_error(Optional<u32> view, StringView text, JsonValue request)
-{
-    JsonObject error;
-    error.set("type"sv, "error"sv);
-    if (view.has_value())
-        error.set("view"sv, *view);
-    error.set("message"sv, wire_text(text));
-    if (!request.is_null())
-        error.set("request"sv, move(request));
-    send(error);
-}
-
-void EmacsServer::view_did_close(Badge<EmacsWebView>)
-{
-    // Deferred, as this is called from the view.
-    Core::deferred_invoke([this, id = m_view->id()] {
-        if (m_view && m_view->id() == id)
-            m_view = nullptr;
-    });
-}
-
-EmacsWebView& EmacsServer::create_view(Web::DevicePixelSize size, double device_pixel_ratio)
-{
-    VERIFY(!m_view);
-    m_view = EmacsWebView::create(m_theme, size, device_pixel_ratio, *this, m_next_view_id++);
-    return *m_view;
-}
-
-void EmacsServer::handle_control(JsonObject const& message)
-{
-    auto type = message.get_string("type"sv);
-    if (!type.has_value())
-        return;
-
-    // NB: The transport makes a connection the client only for a hello, which is then the first message.
-    if (!m_client.hello_done) {
-        if (*type == "hello"sv)
-            handle_hello(message);
-        return;
-    }
-
-    if (*type == "ping"sv) {
-        JsonObject pong;
-        pong.set("type"sv, "pong"sv);
-        pong.set("id"sv, echoed(message, "id"sv));
-        send(pong);
-        return;
-    }
-    if (*type == "hello"sv) {
-        send_error({}, "hello was already sent"sv);
-        return;
-    }
-    if (*type == "create_view"sv) {
-        handle_create_view(message);
-        return;
-    }
-    if (*type == "close_view"sv) {
-        handle_close_view(message);
-        return;
-    }
-
-    auto view_id = message.get_u32("view"sv);
-
-    if (*type == "shm_failed"sv) {
-        m_client.uses_shared_memory = false;
-        if (m_view && view_id == m_view->id())
-            m_view->client_cannot_use_shared_memory();
-        return;
-    }
-
-    if (m_view && view_id == m_view->id()) {
-        m_view->handle_message(*type, message);
-        return;
-    }
-
-    // An answer or acknowledgement for a view that is gone needs no reply, and unknown messages are ignored.
-    static constexpr Array commands = {
-        "mouse"sv, "key"sv, "text"sv, "set_viewport"sv, "set_visibility"sv, "set_focus"sv, "load"sv, "load_html"sv,
-        "reload"sv, "stop"sv, "history"sv, "zoom"sv, "find"sv, "find_step"sv, "edit"sv, "paste"sv,
-        "request_selection"sv, "screenshot"sv, "set_console"sv, "request_source"sv, "hints"sv, "hints_narrow"sv,
-        "hints_end"sv
-    };
-    if (type->starts_with_bytes("hints"sv) && commands.contains_slow(type->bytes_as_string_view())) {
-        // NB: An error that answers a hints message names the session it did.
-        JsonObject error;
-        error.set("type"sv, "error"sv);
-        if (view_id.has_value())
-            error.set("view"sv, *view_id);
-        error.set("message"sv, "unknown view"sv);
-        if (auto id = message.get("id"sv); id.has_value())
-            error.set("id"sv, *id);
-        send(error);
-    } else if (commands.contains_slow(type->bytes_as_string_view())) {
-        send_error(view_id, "unknown view"sv);
-    }
-}
-
-void EmacsServer::handle_hello(JsonObject const& message)
-{
-    // The client lists what it decodes in the order it prefers.
-    m_client.accepts_zstd = false;
-    if (auto encodings = message.get_array("encodings"sv); encodings.has_value()) {
-        for (auto const& encoding : encodings->values()) {
-            if (!encoding.is_string())
-                continue;
-            if (encoding.as_string() == "zstd"sv)
-                m_client.accepts_zstd = true;
-            if (encoding.as_string() == "zstd"sv || encoding.as_string() == "raw"sv)
-                break;
-        }
-    }
-    // NB: Only the client knows whether it runs on this machine.
-    m_client.uses_shared_memory = message.get_bool("shm"sv).value_or(false);
-    m_client.hello_done = true;
-
-    dbgln("Emacs: client '{}' connected over {}", message.get_string("client"sv).value_or({}), m_transport->kind() == EmacsTransport::Kind::Stdio ? "stdio"sv : "a socket"sv);
-
-    char hostname[256] {};
-    (void)::gethostname(hostname, sizeof(hostname) - 1);
-#if defined(AK_OS_MACOS)
-    auto platform = "macos"sv;
-#elif defined(AK_OS_LINUX)
-    auto platform = "linux"sv;
-#else
-    auto platform = "unknown"sv;
-#endif
-
-    JsonObject host;
-    host.set("hostname"sv, wire_text(StringView { hostname, strlen(hostname) }));
-    host.set("platform"sv, platform);
-
-    JsonArray views;
-    if (m_view)
-        views.must_append(m_view->description());
-
-    JsonObject welcome;
-    welcome.set("type"sv, "welcome"sv);
-    welcome.set("protocol"sv, EmacsProtocol::protocol_version);
-    welcome.set("server"sv, BROWSER_PRODUCT_NAME " " BROWSER_VERSION ""sv);
-    welcome.set("encoding"sv, m_client.accepts_zstd ? "zstd"sv : "raw"sv);
-    welcome.set("shm"sv, m_client.uses_shared_memory);
-    welcome.set("log"sv, wire_text(EmacsTransport::log_path()));
-    welcome.set("host"sv, move(host));
-    JsonArray features;
-    features.must_append("hints"sv);
-    welcome.set("features"sv, move(features));
-    welcome.set("views"sv, move(views));
-    send(welcome);
-
-    if (m_view)
-        m_view->client_changed();
-}
-
-void EmacsServer::handle_create_view(JsonObject const& message)
-{
-    auto request = echoed(message, "request"sv);
-    if (m_view) {
-        send_error(m_view->id(), "only one view is supported"sv, request);
-        return;
-    }
-
-    auto viewport = viewport_from(message, { { 800, 600 }, 1.0 });
-    if (viewport.is_error()) {
-        send_error({}, viewport.error().string_literal(), request);
-        return;
-    }
-
-    Optional<URL::URL> url;
-    if (auto text = message.get_string("url"sv); text.has_value() && !text->is_empty()) {
-        url = sanitize_url(*text, Application::settings().search_engine_settings().engine);
-        if (!url.has_value()) {
-            send_error({}, wire_formatted("not a URL: {}", *text), request);
-            return;
-        }
-    }
-
-    auto& view = create_view(viewport.value().size, viewport.value().device_pixel_ratio);
-
-    auto created = view.description();
-    created.set("type"sv, "view_created"sv);
-    if (!request.is_null())
-        created.set("request"sv, request);
-    send(created);
-
-    // The load starts before the first state goes out, so that state says the view is loading.
-    if (url.has_value())
-        view.load_from_browser_ui(*url);
-    view.client_changed();
-}
-
-void EmacsServer::handle_close_view(JsonObject const& message)
-{
-    auto view_id = message.get_u32("view"sv);
-    if (!m_view || view_id != m_view->id()) {
-        send_error(view_id, "unknown view"sv);
-        return;
-    }
-
-    m_view = nullptr;
-
-    JsonObject closed;
-    closed.set("type"sv, "view_closed"sv);
-    closed.set("view"sv, *view_id);
-    closed.set("reason"sv, "client"sv);
-    send(closed);
 }
 
 }

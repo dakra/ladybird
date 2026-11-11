@@ -57,9 +57,16 @@ public:
     // The client is gone and none took its place, or on the standard streams, the stream ended. This is never called
     // from within a call into the transport.
     Function<void()> on_client_disconnected;
+    // The client has read some of what it was sent.
+    Function<void()> on_wrote;
 
     Kind kind() const { return m_kind; }
     bool has_client() const { return m_client; }
+    // The bytes the client has yet to read.
+    size_t queued_bytes() const { return m_client ? m_client->outbox_size : 0; }
+    // How far into the stream the client has read, and where the stream ends so far, in bytes from where it started.
+    u64 written_bytes() const { return m_client ? m_client->bytes_written : 0; }
+    u64 end_of_stream() const { return written_bytes() + queued_bytes(); }
 
     // Fails for a message that does not fit a record.
     ErrorOr<void> send_control(JsonObject const&);
@@ -87,6 +94,7 @@ private:
         Queue<ByteBuffer> outbox;
         size_t outbox_offset { 0 };
         size_t outbox_size { 0 };
+        u64 bytes_written { 0 };
     };
 
     enum class WriteResult : u8 {

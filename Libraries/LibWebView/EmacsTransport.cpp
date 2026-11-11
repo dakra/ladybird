@@ -508,7 +508,8 @@ void EmacsTransport::send_record(ByteBuffer&& record)
         connection_lost(id);
         return;
     }
-    if (m_client->outbox_size > maximum_queued_bytes) {
+    // NB: What the client was sent meanwhile, from on_wrote, can have cost the connection already.
+    if (m_client && m_client->id == id && m_client->outbox_size > maximum_queued_bytes) {
         dbgln("Emacs: the client does not read its stream, disconnecting it");
         connection_lost(id);
     }
@@ -524,6 +525,8 @@ EmacsTransport::WriteResult EmacsTransport::enqueue(Connection& connection, Byte
 
 EmacsTransport::WriteResult EmacsTransport::write_queued(Connection& connection)
 {
+    auto wrote = false;
+    auto result = WriteResult::Drained;
     while (!connection.outbox.is_empty()) {
         auto bytes = connection.outbox.head().bytes().slice(connection.outbox_offset);
         auto written = write_without_sigpipe(connection.out_fd, bytes, connection.is_socket);
@@ -532,11 +535,14 @@ EmacsTransport::WriteResult EmacsTransport::write_queued(Connection& connection)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 connection.write_notifier->set_enabled(true);
-                return WriteResult::Blocked;
+                result = WriteResult::Blocked;
+                break;
             }
             return WriteResult::Failed;
         }
 
+        wrote = true;
+        connection.bytes_written += written;
         connection.outbox_offset += written;
         connection.outbox_size -= written;
         if (connection.outbox_offset == connection.outbox.head().size()) {
@@ -544,8 +550,11 @@ EmacsTransport::WriteResult EmacsTransport::write_queued(Connection& connection)
             connection.outbox_offset = 0;
         }
     }
-    connection.write_notifier->set_enabled(false);
-    return WriteResult::Drained;
+    if (result == WriteResult::Drained)
+        connection.write_notifier->set_enabled(false);
+    if (wrote && &connection == m_client.ptr() && on_wrote)
+        on_wrote();
+    return result;
 }
 
 void EmacsTransport::shutdown()

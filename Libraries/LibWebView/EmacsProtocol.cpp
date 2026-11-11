@@ -77,6 +77,54 @@ void append_frame_header(ByteBuffer& buffer, FrameHeader const& header)
     VERIFY(buffer.size() - size_before == frame_header_size);
 }
 
+String wire_text(StringView text)
+{
+    if (text.length() > maximum_text_bytes) {
+        auto length = maximum_text_bytes;
+        while (length > 0 && (static_cast<u8>(text[length]) & 0xc0) == 0x80)
+            --length;
+        text = text.substring_view(0, length);
+    }
+    return String::from_utf8_with_replacement_character(text, String::WithBOMHandling::No);
+}
+
+static Optional<double> number(JsonObject const& object, StringView key)
+{
+    auto value = object.get(key);
+    if (!value.has_value() || !value->is_number())
+        return {};
+    return value->get_double_with_precision_loss();
+}
+
+static int integer_or(JsonObject const& object, StringView key, int fallback)
+{
+    auto value = number(object, key);
+    if (!value.has_value() || !__builtin_isfinite(*value))
+        return fallback;
+    return static_cast<int>(clamp(AK::round(*value), -2147483647.0, 2147483647.0));
+}
+
+ErrorOr<Viewport> viewport_from(JsonObject const& object, Viewport fallback, i64 area_left)
+{
+    if (area_left < 1)
+        return Error::from_string_literal("the other views take all the pixels the server can render");
+
+    auto device_pixel_ratio = fallback.device_pixel_ratio;
+    if (object.has("dpr"sv)) {
+        auto requested = number(object, "dpr"sv);
+        if (!requested.has_value() || !__builtin_isfinite(*requested) || *requested < minimum_device_pixel_ratio || *requested > maximum_device_pixel_ratio)
+            return Error::from_string_literal("dpr must be a number from 0.25 to 8");
+        device_pixel_ratio = *requested;
+    }
+
+    auto area = min(area_left, maximum_viewport_area);
+    auto width = clamp(integer_or(object, "width"sv, fallback.size.width().value()), 1, maximum_viewport_dimension);
+    width = static_cast<int>(min<i64>(width, area));
+    auto height = clamp(integer_or(object, "height"sv, fallback.size.height().value()), 1, maximum_viewport_dimension);
+    height = static_cast<int>(min<i64>(height, area / width));
+    return Viewport { { width, height }, device_pixel_ratio };
+}
+
 ErrorOr<ByteBuffer> encode_control_record(JsonObject const& message)
 {
     auto json = message.serialized();

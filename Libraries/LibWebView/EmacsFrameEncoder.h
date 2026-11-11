@@ -60,6 +60,9 @@ public:
     // pixels are. Returns whether it did.
     ErrorOr<bool> append_zstd(ByteBuffer&, Gfx::Bitmap const&, Gfx::IntRect);
 
+    // Frees the pixels kept for the next frame to compress.
+    void release_scratch() { m_scratch.clear(); }
+
 private:
     void* m_compression_context { nullptr };
     ByteBuffer m_scratch;

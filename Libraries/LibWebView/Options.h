@@ -101,6 +101,7 @@ struct BrowserOptions {
     double device_pixel_ratio { 1.0 };
     Optional<ByteString> emacs_socket_path {};
     Optional<ByteString> emacs_log_path {};
+    Optional<size_t> emacs_maximum_views {};
     NewWindow new_window { NewWindow::No };
     AllowPopups allow_popups { AllowPopups::No };
     DisableScripting disable_scripting { DisableScripting::No };

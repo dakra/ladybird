@@ -121,7 +121,7 @@ elseif (LINUX)
 endif()
 
 if (NOT WIN32)
-    list(APPEND SOURCES EmacsFrameEncoder.cpp EmacsProtocol.cpp EmacsTransport.cpp EmacsWebView.cpp TerminalInputParser.cpp TerminalWebView.cpp)
+    list(APPEND SOURCES EmacsFrameEncoder.cpp EmacsFrameTurns.cpp EmacsProtocol.cpp EmacsServer.cpp EmacsTransport.cpp EmacsWebView.cpp TerminalInputParser.cpp TerminalWebView.cpp)
 endif()
 
 if (LINUX OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
