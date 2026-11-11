@@ -5,6 +5,11 @@
  */
 
 #include <AK/Endian.h>
+#include <AK/JsonArray.h>
+#include <AK/Math.h>
+#include <AK/StringBuilder.h>
+#include <AK/Utf8View.h>
+#include <LibURL/Parser.h>
 #include <LibWebView/EmacsProtocol.h>
 
 namespace WebView::EmacsProtocol {
@@ -221,6 +226,177 @@ StringView css_cursor_name(Gfx::Cursor const& cursor)
     }
     // NB: The cursor comes from a page's process, which can send a value that is none of these.
     return "default"sv;
+}
+
+bool is_valid_hint_alphabet(StringView alphabet)
+{
+    if (alphabet.length() < 2 || alphabet.length() > 36)
+        return false;
+    for (size_t i = 0; i < alphabet.length(); ++i) {
+        auto character = alphabet[i];
+        if (!is_ascii_lower_alpha(character) && !is_ascii_digit(character))
+            return false;
+        if (alphabet.substring_view(0, i).contains(character))
+            return false;
+    }
+    return true;
+}
+
+Optional<u64> hint_session_id(JsonValue const& id)
+{
+    static constexpr double maximum_id = 9007199254740992.0;
+    if (!id.is_number())
+        return {};
+    auto number = id.get_double_with_precision_loss().value_or(AK::NaN<double>);
+    if (!(number >= 0) || number >= maximum_id || number != AK::trunc(number))
+        return {};
+    return static_cast<u64>(number);
+}
+
+size_t hint_label_length(size_t alphabet_length, size_t count)
+{
+    VERIFY(alphabet_length >= 2);
+    size_t length = 1;
+    for (size_t capacity = alphabet_length; capacity < count; capacity *= alphabet_length)
+        ++length;
+    return length;
+}
+
+bool is_valid_hint_prefix(StringView prefix, StringView alphabet, size_t label_length)
+{
+    if (prefix.length() > label_length)
+        return false;
+    for (auto character : prefix) {
+        if (!alphabet.contains(character))
+            return false;
+    }
+    return true;
+}
+
+Vector<String> hint_labels(StringView alphabet, size_t count)
+{
+    VERIFY(is_valid_hint_alphabet(alphabet));
+
+    Vector<String> labels;
+    if (count == 0)
+        return labels;
+
+    auto length = hint_label_length(alphabet.length(), count);
+
+    labels.ensure_capacity(count);
+    Vector<char, 16> characters;
+    characters.resize(length);
+    for (size_t index = 0; index < count; ++index) {
+        auto rest = index;
+        for (size_t position = length; position > 0; --position) {
+            characters[position - 1] = alphabet[rest % alphabet.length()];
+            rest /= alphabet.length();
+        }
+        labels.unchecked_append(MUST(String::from_utf8(StringView { characters.data(), characters.size() })));
+    }
+    return labels;
+}
+
+String hint_label_mask(Vector<String> const& labels, StringView prefix)
+{
+    StringBuilder mask;
+    for (auto const& label : labels)
+        mask.append(label.starts_with_bytes(prefix) ? '1' : '0');
+    return mask.to_string_without_validation();
+}
+
+Optional<size_t> hint_activation_index(JsonValue const& activate, size_t count)
+{
+    if (!activate.is_number())
+        return {};
+    auto index = activate.get_double_with_precision_loss().value_or(AK::NaN<double>);
+    if (!(index >= 0) || index >= static_cast<double>(count) || index != AK::trunc(index))
+        return {};
+    return static_cast<size_t>(index);
+}
+
+StringView hint_kind_name(HintKind kind)
+{
+    switch (kind) {
+    case HintKind::Link:
+        return "link"sv;
+    case HintKind::Button:
+        return "button"sv;
+    case HintKind::Input:
+        return "input"sv;
+    case HintKind::Other:
+        return "other"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+static String hint_text(StringView text)
+{
+    // NB: JsonParser writes an escaped lone surrogate as WTF-8.
+    auto valid = String::from_wtf8_with_replacement_character(text);
+    Utf8View view { valid };
+    if (view.length() <= maximum_hint_text_length)
+        return valid;
+    return MUST(String::from_utf8(valid.bytes_as_string_view().substring_view(0, view.byte_offset_of(maximum_hint_text_length))));
+}
+
+static double hint_coordinate(JsonObject const& object, StringView key)
+{
+    // NB: A page can report any number; one beyond what a viewport could be is as useless as none.
+    static constexpr double maximum_coordinate = 1e9;
+    auto value = object.get(key);
+    if (!value.has_value() || !value->is_number())
+        return 0;
+    auto number = value->get_double_with_precision_loss().value_or(0);
+    if (!__builtin_isfinite(number))
+        return 0;
+    return clamp(number, -maximum_coordinate, maximum_coordinate);
+}
+
+ErrorOr<HintCollection> parse_hint_collection(StringView json)
+{
+    auto parsed = TRY(JsonValue::from_string(json));
+    if (!parsed.is_object())
+        return Error::from_string_literal("The hint collection is not an object");
+    auto items = parsed.as_object().get_array("items"sv);
+    if (!items.has_value())
+        return Error::from_string_literal("The hint collection has no items");
+
+    HintCollection collection;
+    collection.truncated = items->size() > maximum_hint_count;
+    collection.items.ensure_capacity(min(items->size(), maximum_hint_count));
+    for (size_t index = 0; index < items->size() && index < maximum_hint_count; ++index) {
+        HintItem item;
+        if (auto const& value = items->at(index); value.is_object()) {
+            auto const& object = value.as_object();
+            auto kind = object.get_string("kind"sv).value_or({});
+            if (kind == "link"sv)
+                item.kind = HintKind::Link;
+            else if (kind == "button"sv)
+                item.kind = HintKind::Button;
+            else if (kind == "input"sv)
+                item.kind = HintKind::Input;
+
+            if (auto text = object.get_string("text"sv); text.has_value())
+                item.text = hint_text(*text);
+
+            // NB: The URL is parsed again, so that what goes to the client is an absolute URL whatever the page wrote.
+            if (auto url = object.get_string("url"sv); item.kind == HintKind::Link && url.has_value() && url->byte_count() <= maximum_hint_url_length) {
+                if (auto parsed_url = URL::Parser::basic_parse(*url); parsed_url.has_value()) {
+                    auto serialized = parsed_url->serialize();
+                    if (serialized.byte_count() <= maximum_hint_url_length)
+                        item.url = move(serialized);
+                }
+            }
+
+            item.x = hint_coordinate(object, "x"sv);
+            item.y = hint_coordinate(object, "y"sv);
+            item.width = hint_coordinate(object, "width"sv);
+            item.height = hint_coordinate(object, "height"sv);
+        }
+        collection.items.unchecked_append(move(item));
+    }
+    return collection;
 }
 
 }

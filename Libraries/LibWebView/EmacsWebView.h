@@ -11,12 +11,14 @@
 #include <AK/JsonValue.h>
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
+#include <AK/Time.h>
 #include <AK/Vector.h>
 #include <LibCore/Forward.h>
 #include <LibGfx/Rect.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/UIEvents/MouseButton.h>
 #include <LibWebView/EmacsFrameEncoder.h>
+#include <LibWebView/EmacsProtocol.h>
 #include <LibWebView/EmacsTransport.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/Options.h>
@@ -75,6 +77,48 @@ private:
         Optional<ByteString> path;
     };
 
+    // The scripts of a hint session whose answer the server waits for.
+    enum class HintScript : u8 {
+        Collect,
+        Draw,
+        Activate,
+        // Its answer is taken and dropped.
+        Ignore,
+    };
+
+    struct PendingHintScript {
+        HintScript kind { HintScript::Collect };
+        u64 session { 0 };
+        MonotonicTime deadline;
+    };
+
+    // The labels the client asked for, which the page holds under a global property only the server knows the name of.
+    struct HintSession {
+        u64 serial { 0 };
+        u64 id { 0 };
+        String name;
+        String alphabet;
+        // What the page reported, until the labels are drawn and the client is sent the list.
+        Optional<EmacsProtocol::HintCollection> collection;
+        Vector<String> labels;
+        bool listed { false };
+        String prefix;
+        RefPtr<Core::Timer> timeout;
+    };
+
+    enum class HintSessionEnd : u8 {
+        // The client ended it, or is gone: the page removes the labels.
+        Silently,
+        // Another document is active: the client is told, and whichever document the session's scripts ran in forgets
+        // it.
+        Navigated,
+        // The page's process or view is gone: the client is told.
+        PageGone,
+        // The page did not answer in time, or not usably: the client is told, and the page removes the labels once it
+        // gets to it.
+        PageFailed,
+    };
+
     EmacsWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize, double device_pixel_ratio, EmacsServer&, u32 id);
 
     // ^ViewImplementation
@@ -110,6 +154,24 @@ private:
     void handle_request_selection(JsonObject const&);
     void handle_screenshot(JsonObject const&);
     void save_screenshot(PendingScreenshot const&, Gfx::Bitmap const&);
+
+    void handle_hints(JsonObject const&);
+    void handle_hints_narrow(JsonObject const&);
+    void handle_hints_end(JsonObject const&);
+    HintSession* hint_session_named_by(JsonObject const&);
+    void send_hint_error(StringView text, JsonObject const& request);
+    void run_hint_script(StringView body, HintScript = HintScript::Ignore);
+    void install_hint_dispatcher();
+    void dispatch_console_result(DebuggerValue);
+    void settle_console_result_callback(Function<void(DebuggerValue)> callback_that_was_called);
+    bool did_receive_hint_script_result(DebuggerValue const&);
+    void ignore_hint_scripts();
+    void did_collect_hints(StringView json);
+    void did_draw_hints(StringView result);
+    void did_end_hints(StringView json);
+    void send_hints_list(JsonArray items, bool truncated);
+    void end_hint_session(HintSessionEnd, Optional<size_t> activate = {});
+    void click_at(Gfx::IntPoint);
 
     // Asks the client, unless the request does not fit a record.
     Optional<u64> open_request(RequestKind, JsonObject);
@@ -180,6 +242,13 @@ private:
     HashMap<u64, Function<void(bool)>> m_external_url_callbacks;
 
     HashMap<u64, NonnullRefPtr<Core::Timer>> m_popup_timers;
+
+    Optional<HintSession> m_hint_session;
+    u64 m_next_hint_session_serial { 1 };
+    // By the token a script's answer starts with.
+    HashMap<String, PendingHintScript> m_pending_hint_scripts;
+    bool m_hint_dispatcher_installed { false };
+    Function<void(DebuggerValue)> m_console_result_callback_before_hints;
 };
 
 // The Emacs headless mode: one client at a time on a transport, and the view it shows, if any. The server keeps running,

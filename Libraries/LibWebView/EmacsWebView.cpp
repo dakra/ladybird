@@ -9,6 +9,7 @@
 #include <AK/Format.h>
 #include <AK/JsonArray.h>
 #include <AK/JsonValue.h>
+#include <AK/Random.h>
 #include <AK/String.h>
 #include <AK/StringBuilder.h>
 #include <AK/Time.h>
@@ -24,6 +25,7 @@
 #include <LibWebCommon/Clipboard/SystemClipboard.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/WebView/ConsoleOutput.h>
+#include <LibWebCommon/WebView/Debugger.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/EmacsProtocol.h>
 #include <LibWebView/EmacsWebView.h>
@@ -354,6 +356,10 @@ EmacsWebView::EmacsWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize vie
     on_web_content_crashed = [this](WebContentCrashReason reason) {
         // Nothing is left of the page that asked.
         withdraw_page_requests();
+        end_hint_session(HintSessionEnd::PageGone);
+        // NB: The process that was to answer them is gone.
+        m_pending_hint_scripts.clear();
+        settle_console_result_callback({});
         if (m_pending_screenshot.has_value()) {
             m_pending_screenshot.clear();
             send_error("cannot take a screenshot: the page crashed"sv);
@@ -372,10 +378,13 @@ EmacsWebView::EmacsWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize vie
             return;
         m_active_document_id = document_id;
         withdraw_page_requests();
+        ignore_hint_scripts();
+        end_hint_session(HintSessionEnd::Navigated);
     };
 
     on_close = [this] {
         withdraw_page_requests();
+        end_hint_session(HintSessionEnd::PageGone);
         auto closed = message("view_closed"sv);
         closed.set("reason"sv, "closed"sv);
         send(closed);
@@ -673,6 +682,8 @@ void EmacsWebView::send_state()
 
 void EmacsWebView::client_went_away()
 {
+    // The labels were for the client that asked for them.
+    end_hint_session(HintSessionEnd::Silently);
     m_client_knows_view = false;
     m_frame_in_flight = false;
     m_frame_needs_full = true;
@@ -982,6 +993,12 @@ void EmacsWebView::handle_message(StringView type, JsonObject const& object)
     } else if (type == "set_console"sv) {
         m_console_enabled = object.get_bool("enabled"sv).value_or(false);
         start_sending_console_output(m_console_enabled, m_console_enabled);
+    } else if (type == "hints"sv) {
+        handle_hints(object);
+    } else if (type == "hints_narrow"sv) {
+        handle_hints_narrow(object);
+    } else if (type == "hints_end"sv) {
+        handle_hints_end(object);
     } else if (type == "request_source"sv) {
         send_error("request_source is not supported"sv);
     } else if (type == "dialog_closed"sv) {
@@ -1282,6 +1299,661 @@ void EmacsWebView::save_screenshot(PendingScreenshot const& screenshot, Gfx::Bit
     saved.set("request"sv, screenshot.request);
     saved.set("path"sv, wire_text(saved_path.value()));
     send(saved);
+}
+
+// The script that finds what a hint session labels. It runs in the page, so it treats every element alike and returns
+// what it found as JSON; the server checks all of it. It leaves the elements, and the functions that draw, narrow and
+// remove their labels, under a global property whose name the server made up.
+static constexpr auto hint_collect_script = R"~~~((function () {
+    "use strict";
+    var w = window, d = document, name = "@NAME@";
+    var elements = [], items = [], host = null, labels = [];
+    var roles = " button link tab menuitem checkbox radio switch option ";
+    var textTypes = " text search email url tel password number ";
+    var hostStyle = ["all", "initial", "position", "absolute", "left", "0", "top", "0", "width", "0", "height", "0",
+        "margin", "0", "padding", "0", "border", "0", "display", "block", "overflow", "visible", "z-index", "2147483647",
+        "pointer-events", "none", "visibility", "visible", "opacity", "1", "transform", "none", "filter", "none"];
+    var labelStyle = "position:absolute;display:block;box-sizing:border-box;margin:0;padding:0 2px;" +
+        "border:1px solid #a08a00;border-radius:2px;background:#fff3a3;color:#1a1a1a;" +
+        "font:bold 11px/13px monospace;letter-spacing:0;white-space:nowrap;text-transform:none;" +
+        "text-decoration:none;pointer-events:none;";
+
+    function roleOf(el) {
+        var role = el.getAttribute("role");
+        return role ? role.trim().split(/\s+/)[0].toLowerCase() : "";
+    }
+    function isTextField(el) {
+        var tag = el.localName;
+        if (tag === "textarea")
+            return true;
+        if (tag === "input")
+            return textTypes.indexOf(" " + el.type + " ") >= 0;
+        return el.hasAttribute("contenteditable") && el.isContentEditable === true;
+    }
+    function canActivate(el) {
+        var tag = el.localName;
+        if ((tag === "a" || tag === "area") && el.hasAttribute("href"))
+            return true;
+        if (tag === "input")
+            return el.type !== "hidden";
+        if (tag === "button" || tag === "select" || tag === "textarea" || tag === "summary" || tag === "label")
+            return true;
+        var editable = el.getAttribute("contenteditable");
+        if (editable !== null && editable.toLowerCase() !== "false")
+            return true;
+        if (el.hasAttribute("onclick"))
+            return true;
+        var tabindex = el.getAttribute("tabindex");
+        if (tabindex !== null && parseInt(tabindex, 10) >= 0)
+            return true;
+        var role = roleOf(el);
+        return role !== "" && roles.indexOf(" " + role + " ") >= 0;
+    }
+    function isDisabled(el) {
+        try {
+            return el.matches(":disabled");
+        } catch (e) {
+            return false;
+        }
+    }
+    function kindOf(el) {
+        var tag = el.localName, role = roleOf(el);
+        if (((tag === "a" || tag === "area") && el.hasAttribute("href")) || role === "link")
+            return "link";
+        if (isTextField(el))
+            return "input";
+        if (tag === "button" || tag === "summary" || role === "button")
+            return "button";
+        if (tag === "input" && " button submit reset image ".indexOf(" " + el.type + " ") >= 0)
+            return "button";
+        return "other";
+    }
+    function clean(text) {
+        if (typeof text !== "string")
+            return "";
+        text = text.replace(/\s+/g, " ").trim();
+        if (text.length > 200) {
+            text = text.slice(0, 200);
+            var last = text.charCodeAt(199);
+            if (last >= 0xd800 && last <= 0xdbff)
+                text = text.slice(0, 199);
+        }
+        return typeof text.toWellFormed === "function" ? text.toWellFormed() : text;
+    }
+    function labelText(el) {
+        var found = el.labels;
+        return found && found.length ? found[0].innerText : "";
+    }
+    function textOf(el) {
+        var tag = el.localName, text = el.getAttribute("aria-label");
+        if (clean(text))
+            return clean(text);
+        if (tag === "input") {
+            var type = el.type;
+            if (type === "submit" || type === "reset" || type === "button")
+                text = el.value;
+            else if (type === "image")
+                text = el.alt;
+            else if (type === "checkbox" || type === "radio" || type === "password" || type === "file")
+                text = "";
+            else
+                text = el.value;
+            if (!clean(text))
+                text = labelText(el) || el.placeholder || el.title;
+        } else if (tag === "textarea") {
+            text = el.value || labelText(el) || el.placeholder || el.title;
+        } else if (tag === "select") {
+            var selected = el.selectedOptions;
+            text = (selected && selected.length ? selected[0].text : "") || labelText(el) || el.title;
+        } else {
+            text = el.innerText;
+            if (!clean(text)) {
+                var image = el.querySelector("img[alt]");
+                text = (image && image.alt) || el.title || "";
+            }
+        }
+        return clean(text);
+    }
+    function urlOf(el) {
+        var tag = el.localName;
+        if ((tag !== "a" && tag !== "area") || !el.hasAttribute("href"))
+            return null;
+        var url = el.href;
+        if (typeof url !== "string") {
+            try {
+                url = new URL(el.getAttribute("href"), d.baseURI).href;
+            } catch (e) {
+                return null;
+            }
+        }
+        if (typeof url !== "string" || url.length > 16384)
+            return null;
+        return typeof url.toWellFormed === "function" ? url.toWellFormed() : url;
+    }
+    function intersects(rect, width, height) {
+        return rect.right > 0 && rect.bottom > 0 && rect.left < width && rect.top < height;
+    }
+    function placeOf(el, width, height) {
+        var rects = el.getClientRects();
+        for (var i = 0; i < rects.length; ++i) {
+            if (rects[i].width > 0 && rects[i].height > 0 && intersects(rects[i], width, height))
+                return rects[i];
+        }
+        return el.getBoundingClientRect();
+    }
+    function clearLabels() {
+        if (host && host.parentNode)
+            host.parentNode.removeChild(host);
+        host = null;
+        labels = [];
+    }
+    function narrow(mask, typed) {
+        for (var i = 0; i < labels.length; ++i) {
+            var label = labels[i];
+            label.typed.textContent = label.text.slice(0, typed);
+            label.rest.textContent = label.text.slice(typed);
+            label.box.style.display = mask.charAt(i) === "1" ? "block" : "none";
+        }
+        return "narrowed";
+    }
+    function draw(texts, mask, typed) {
+        clearLabels();
+        var root = d.documentElement;
+        if (!root)
+            return "no document";
+        host = d.createElement("@HOST@");
+        for (var i = 0; i < hostStyle.length; i += 2)
+            host.style.setProperty(hostStyle[i], hostStyle[i + 1], "important");
+        var shadow = host.attachShadow({ mode: "closed" });
+        var width = w.innerWidth, height = w.innerHeight, places = [];
+        for (i = 0; i < texts.length && i < elements.length; ++i) {
+            var box = d.createElement("span"), typedPart = d.createElement("span"), rest = d.createElement("span");
+            box.style.cssText = labelStyle;
+            typedPart.style.cssText = "color:#d04000";
+            box.appendChild(typedPart);
+            box.appendChild(rest);
+            shadow.appendChild(box);
+            labels.push({ box: box, typed: typedPart, rest: rest, text: texts[i] });
+            places.push(placeOf(elements[i], width, height));
+        }
+        narrow(texts.map(function () { return "1"; }).join(""), 0);
+        root.appendChild(host);
+        var origin = host.getBoundingClientRect(), sizes = [];
+        for (i = 0; i < labels.length; ++i)
+            sizes.push([labels[i].box.offsetWidth, labels[i].box.offsetHeight]);
+        for (i = 0; i < labels.length; ++i) {
+            var left = Math.max(0, Math.min(places[i].left, width - sizes[i][0]));
+            var top = Math.max(0, Math.min(places[i].top, height - sizes[i][1]));
+            labels[i].box.style.left = (left - origin.left) + "px";
+            labels[i].box.style.top = (top - origin.top) + "px";
+        }
+        narrow(mask, typed);
+        return "drawn";
+    }
+    function placeCaret(el) {
+        try {
+            if (el.localName === "input" || el.localName === "textarea") {
+                var length = el.value.length;
+                el.setSelectionRange(length, length);
+            } else {
+                var selection = w.getSelection();
+                selection.selectAllChildren(el);
+                selection.collapseToEnd();
+            }
+        } catch (e) {
+        }
+    }
+    function clickPoint(el) {
+        var width = w.innerWidth, height = w.innerHeight, rects = el.getClientRects(), fractions = [0.5, 0.25, 0.75];
+        for (var i = 0; i < rects.length; ++i) {
+            var left = Math.max(rects[i].left, 0), right = Math.min(rects[i].right, width);
+            var top = Math.max(rects[i].top, 0), bottom = Math.min(rects[i].bottom, height);
+            if (right - left < 1 || bottom - top < 1)
+                continue;
+            for (var row = 0; row < fractions.length; ++row) {
+                for (var column = 0; column < fractions.length; ++column) {
+                    var x = left + (right - left) * fractions[column], y = top + (bottom - top) * fractions[row];
+                    var hit = d.elementFromPoint(x, y);
+                    while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === "function") {
+                        var inner = hit.shadowRoot.elementFromPoint(x, y);
+                        if (!inner || inner === hit)
+                            break;
+                        hit = inner;
+                    }
+                    if (hit && (hit === el || el.contains(hit)))
+                        return [x, y];
+                }
+            }
+        }
+        return null;
+    }
+    function end(index) {
+        clearLabels();
+        try {
+            delete w[name];
+        } catch (e) {
+        }
+        var el = index >= 0 && index < elements.length ? elements[index] : null;
+        elements = [];
+        if (!el || !el.isConnected)
+            return JSON.stringify({ action: "none" });
+        if (isTextField(el)) {
+            el.focus();
+            placeCaret(el);
+            return JSON.stringify({ action: "focus" });
+        }
+        try {
+            el.focus({ preventScroll: true });
+        } catch (e) {
+        }
+        var point = clickPoint(el);
+        if (point)
+            return JSON.stringify({ action: "click", x: point[0], y: point[1] });
+        if (typeof el.click === "function")
+            el.click();
+        else
+            el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: w }));
+        return JSON.stringify({ action: "script" });
+    }
+
+    var selector = "a,area,button,input,select,textarea,summary,label,[contenteditable],[onclick],[tabindex],[role]";
+    var width = w.innerWidth, height = w.innerHeight;
+    function consider(el) {
+        if (!el.matches(selector) || !canActivate(el) || isDisabled(el))
+            return;
+        var rect = el.getBoundingClientRect();
+        if (!(rect.width >= 1 && rect.height >= 1 && intersects(rect, width, height)))
+            return;
+        var style = w.getComputedStyle(el);
+        if (style.visibility !== "visible" || style.display === "none")
+            return;
+        elements.push(el);
+        items.push({ kind: kindOf(el), text: textOf(el), url: urlOf(el), x: rect.left, y: rect.top, width: rect.width, height: rect.height });
+    }
+    // An element of an open shadow root comes right after its host.
+    function walk(root) {
+        var all = root.querySelectorAll("*");
+        for (var i = 0; i < all.length && elements.length < @LIMIT@; ++i) {
+            consider(all[i]);
+            if (all[i].shadowRoot)
+                walk(all[i].shadowRoot);
+        }
+    }
+    if (d.documentElement)
+        walk(d);
+    Object.defineProperty(w, name, { value: { draw: draw, narrow: narrow, end: end }, configurable: true });
+    return JSON.stringify({ items: items });
+})())~~~"sv;
+
+// What every hint script is run inside: whatever the page did to the script, the answer is the token of the request,
+// a newline, and a string of bounded length.
+static constexpr auto hint_script_wrapper = R"~~~((function () {
+    var token = "@TOKEN@", result = null;
+    try {
+        result = @BODY@;
+    } catch (e) {
+        result = null;
+    }
+    if (typeof result !== "string" || result.length > @MAXIMUM@)
+        result = "null";
+    return token + "\n" + result;
+})())~~~"sv;
+
+static constexpr auto hint_answer_timeout = AK::Duration::from_seconds(5);
+// How long the token of an unanswered script is known after its answer is due, so that a late answer is still taken.
+static constexpr auto hint_token_lifetime = AK::Duration::from_seconds(60);
+// The longest answer a hint script gives, in UTF-16 code units: a JSON item per element, of at most 200 characters of
+// text and 16 KiB of URL.
+static constexpr size_t maximum_hint_answer_length = 20'000'000;
+
+static String random_hex_name()
+{
+    return MUST(String::formatted("{:016x}{:016x}", get_random<u64>(), get_random<u64>()));
+}
+
+static String replace_placeholder(String const& text, StringView placeholder, StringView value)
+{
+    return MUST(text.replace(placeholder, value, ReplaceMode::All));
+}
+
+void EmacsWebView::run_hint_script(StringView body, HintScript kind)
+{
+    auto token = random_hex_name();
+    auto script = MUST(String::from_utf8(hint_script_wrapper));
+    script = replace_placeholder(script, "@TOKEN@"sv, token);
+    script = replace_placeholder(script, "@MAXIMUM@"sv, String::number(maximum_hint_answer_length));
+    script = replace_placeholder(script, "@BODY@"sv, body);
+
+    auto now = MonotonicTime::now();
+    m_pending_hint_scripts.remove_all_matching([&](auto const&, auto const& pending) { return pending.deadline + hint_token_lifetime < now; });
+    m_pending_hint_scripts.set(token, { kind, m_hint_session.has_value() ? m_hint_session->serial : 0, now + hint_answer_timeout });
+
+    install_hint_dispatcher();
+    js_console_input(script);
+}
+
+// The console's answers also go to DevTools, which puts its own callback in place while it evaluates something and
+// removes it once it has its answer. While a hint script is unanswered, the server's callback is in place: it takes the
+// answers that start with the token of one of its scripts, and passes on the others to the callback it replaced.
+void EmacsWebView::install_hint_dispatcher()
+{
+    if (m_hint_dispatcher_installed && on_received_js_console_result)
+        return;
+    m_console_result_callback_before_hints = move(on_received_js_console_result);
+    on_received_js_console_result = [this](DebuggerValue result) { dispatch_console_result(move(result)); };
+    m_hint_dispatcher_installed = true;
+}
+
+void EmacsWebView::dispatch_console_result(DebuggerValue result)
+{
+    Function<void(DebuggerValue)> callback;
+    if (!did_receive_hint_script_result(result) && m_console_result_callback_before_hints) {
+        // NB: DevTools' callback removes the one in place, which is this one, once it is called.
+        callback = move(m_console_result_callback_before_hints);
+        callback(move(result));
+    }
+
+    // NB: The callback in place cannot be replaced while it runs.
+    Core::deferred_invoke([weak_this = make_weak_ptr<EmacsWebView>(), callback = move(callback)]() mutable {
+        if (weak_this)
+            weak_this->settle_console_result_callback(move(callback));
+    });
+}
+
+void EmacsWebView::settle_console_result_callback(Function<void(DebuggerValue)> callback_that_was_called)
+{
+    if (!on_received_js_console_result)
+        m_hint_dispatcher_installed = false;
+    else if (callback_that_was_called)
+        m_console_result_callback_before_hints = move(callback_that_was_called);
+
+    auto now = MonotonicTime::now();
+    m_pending_hint_scripts.remove_all_matching([&](auto const&, auto const& pending) { return pending.deadline + hint_token_lifetime < now; });
+    if (!m_pending_hint_scripts.is_empty()) {
+        install_hint_dispatcher();
+    } else if (m_hint_dispatcher_installed) {
+        on_received_js_console_result = move(m_console_result_callback_before_hints);
+        m_hint_dispatcher_installed = false;
+    }
+}
+
+bool EmacsWebView::did_receive_hint_script_result(DebuggerValue const& result)
+{
+    if (result.type != DebuggerValueType::String || result.text.length_in_code_units() > maximum_hint_answer_length + 64)
+        return false;
+    auto text = String::from_utf16_with_replacement_character(result.text.utf16_view());
+    if (text.is_error())
+        return false;
+
+    auto answer = text.value().bytes_as_string_view();
+    auto newline = answer.find('\n');
+    if (!newline.has_value())
+        return false;
+    auto pending = m_pending_hint_scripts.take(MUST(String::from_utf8(answer.substring_view(0, *newline))));
+    if (!pending.has_value())
+        return false;
+    if (pending->kind == HintScript::Ignore || pending->deadline < MonotonicTime::now())
+        return true;
+    auto payload = answer.substring_view(*newline + 1);
+
+    if (pending->kind == HintScript::Activate) {
+        did_end_hints(payload);
+        return true;
+    }
+    if (!m_hint_session.has_value() || m_hint_session->serial != pending->session)
+        return true;
+    if (pending->kind == HintScript::Collect)
+        did_collect_hints(payload);
+    else
+        did_draw_hints(payload);
+    return true;
+}
+
+// The answers of the scripts that were sent are not acted on.
+void EmacsWebView::ignore_hint_scripts()
+{
+    for (auto& it : m_pending_hint_scripts)
+        it.value.kind = HintScript::Ignore;
+}
+
+EmacsWebView::HintSession* EmacsWebView::hint_session_named_by(JsonObject const& object)
+{
+    auto id = EmacsProtocol::hint_session_id(object.get("id"sv).value_or({}));
+    if (!m_hint_session.has_value() || m_hint_session->id != id)
+        return nullptr;
+    return &*m_hint_session;
+}
+
+// The error names the session the refused message did, so that the client can end it.
+void EmacsWebView::send_hint_error(StringView text, JsonObject const& request)
+{
+    auto error = message("error"sv);
+    error.set("message"sv, wire_text(text));
+    if (auto id = request.get("id"sv); id.has_value())
+        error.set("id"sv, *id);
+    send(error);
+}
+
+void EmacsWebView::handle_hints(JsonObject const& object)
+{
+    auto id = EmacsProtocol::hint_session_id(object.get("id"sv).value_or({}));
+    if (!id.has_value()) {
+        send_hint_error("hints needs an id that is a non-negative integer below 2^53"sv, object);
+        return;
+    }
+    auto alphabet = object.get_string("alphabet"sv);
+    if (!alphabet.has_value() || !EmacsProtocol::is_valid_hint_alphabet(*alphabet)) {
+        send_hint_error("hints needs an alphabet of 2 to 36 distinct characters of a-z and 0-9"sv, object);
+        return;
+    }
+
+    end_hint_session(HintSessionEnd::Silently);
+
+    auto serial = m_next_hint_session_serial++;
+    auto timeout = Core::Timer::create_single_shot(hint_answer_timeout, [weak_this = make_weak_ptr<EmacsWebView>(), serial] {
+        if (!weak_this || !weak_this->m_hint_session.has_value() || weak_this->m_hint_session->serial != serial || weak_this->m_hint_session->listed)
+            return;
+        dbgln("Emacs: the page did not answer a hints request in time");
+        weak_this->end_hint_session(HintSessionEnd::PageFailed);
+    });
+    m_hint_session = HintSession {
+        .serial = serial,
+        .id = *id,
+        .name = MUST(String::formatted("__ladybird_hints_{}", random_hex_name())),
+        .alphabet = *alphabet,
+        .collection = {},
+        .labels = {},
+        .listed = false,
+        .prefix = {},
+        .timeout = timeout,
+    };
+    timeout->start();
+
+    auto script = MUST(String::from_utf8(hint_collect_script));
+    script = replace_placeholder(script, "@NAME@"sv, m_hint_session->name);
+    script = replace_placeholder(script, "@HOST@"sv, MUST(String::formatted("ladybird-hints-{}", random_hex_name())));
+    script = replace_placeholder(script, "@LIMIT@"sv, String::number(EmacsProtocol::maximum_hint_count + 1));
+    run_hint_script(script, HintScript::Collect);
+}
+
+void EmacsWebView::did_collect_hints(StringView json)
+{
+    auto collection = EmacsProtocol::parse_hint_collection(json);
+    if (collection.is_error()) {
+        dbgln("Emacs: the page's hint script answered with something unusable: {}", collection.error());
+        end_hint_session(HintSessionEnd::PageFailed);
+        return;
+    }
+
+    auto& session = *m_hint_session;
+    if (collection.value().items.is_empty()) {
+        send_hints_list({}, false);
+        end_hint_session(HintSessionEnd::Silently);
+        return;
+    }
+
+    session.labels = EmacsProtocol::hint_labels(session.alphabet, collection.value().items.size());
+    session.collection = collection.release_value();
+
+    JsonArray labels;
+    for (auto const& label : session.labels)
+        labels.must_append(label);
+    auto mask = EmacsProtocol::hint_label_mask(session.labels, session.prefix);
+    auto typed_length = mask.contains('1') ? session.prefix.bytes().size() : 0;
+    auto body = MUST(String::formatted("(function () {{ var hints = window[\"{}\"]; return hints ? hints.draw({}, \"{}\", {}) : null; }})()",
+        session.name, labels.serialized(), mask, typed_length));
+    run_hint_script(body, HintScript::Draw);
+}
+
+void EmacsWebView::did_draw_hints(StringView result)
+{
+    if (result != "drawn"sv) {
+        dbgln("Emacs: the page's hint script did not draw the labels: {}", result.substring_view(0, min(result.length(), 100uz)));
+        end_hint_session(HintSessionEnd::PageFailed);
+        return;
+    }
+
+    auto& session = *m_hint_session;
+    auto collection = session.collection.release_value();
+    JsonArray items;
+    for (size_t index = 0; index < collection.items.size(); ++index) {
+        auto const& item = collection.items[index];
+        JsonObject object;
+        object.set("index"sv, static_cast<u64>(index));
+        object.set("label"sv, session.labels[index]);
+        object.set("kind"sv, EmacsProtocol::hint_kind_name(item.kind));
+        object.set("text"sv, item.text);
+        object.set("url"sv, string_or_null(item.url));
+        object.set("x"sv, item.x);
+        object.set("y"sv, item.y);
+        object.set("width"sv, item.width);
+        object.set("height"sv, item.height);
+        items.must_append(move(object));
+    }
+    session.listed = true;
+    if (session.timeout) {
+        session.timeout->stop();
+        session.timeout = nullptr;
+    }
+    send_hints_list(move(items), collection.truncated);
+}
+
+void EmacsWebView::send_hints_list(JsonArray items, bool truncated)
+{
+    auto list = message("hints_list"sv);
+    list.set("id"sv, m_hint_session->id);
+    list.set("items"sv, move(items));
+    list.set("truncated"sv, truncated);
+    send(list);
+}
+
+void EmacsWebView::handle_hints_narrow(JsonObject const& object)
+{
+    auto* session = hint_session_named_by(object);
+    if (!session) {
+        send_hint_error("hints_narrow names no hint session of the view"sv, object);
+        return;
+    }
+    // NB: Until the page has answered, the labels are at most as long as those of the most items there can be.
+    auto label_length = session->labels.is_empty()
+        ? EmacsProtocol::hint_label_length(session->alphabet.bytes().size(), EmacsProtocol::maximum_hint_count)
+        : session->labels.first().bytes().size();
+    auto prefix = object.get_string("prefix"sv);
+    if (!prefix.has_value() || !EmacsProtocol::is_valid_hint_prefix(*prefix, session->alphabet, label_length)) {
+        send_hint_error("hints_narrow needs a prefix of characters of the alphabet, no longer than the labels"sv, object);
+        return;
+    }
+
+    session->prefix = *prefix;
+    // NB: Labels that are yet to be drawn are drawn narrowed.
+    if (session->labels.is_empty())
+        return;
+    auto mask = EmacsProtocol::hint_label_mask(session->labels, session->prefix);
+    auto typed_length = mask.contains('1') ? session->prefix.bytes().size() : 0;
+    run_hint_script(MUST(String::formatted("(function () {{ var hints = window[\"{}\"]; return hints ? hints.narrow(\"{}\", {}) : null; }})()",
+        session->name, mask, typed_length)));
+}
+
+void EmacsWebView::handle_hints_end(JsonObject const& object)
+{
+    auto* session = hint_session_named_by(object);
+    if (!session) {
+        send_hint_error("hints_end names no hint session of the view"sv, object);
+        return;
+    }
+
+    Optional<size_t> index;
+    if (session->listed)
+        index = EmacsProtocol::hint_activation_index(object.get("activate"sv).value_or({}), session->labels.size());
+    end_hint_session(HintSessionEnd::Silently, index);
+}
+
+void EmacsWebView::end_hint_session(HintSessionEnd how, Optional<size_t> activate)
+{
+    if (!m_hint_session.has_value())
+        return;
+    auto session = m_hint_session.release_value();
+    if (session.timeout) {
+        session.timeout->stop();
+        // NB: The timer may be the one whose callback this is.
+        Core::deferred_invoke([timer = move(session.timeout)] { });
+    }
+    for (auto& it : m_pending_hint_scripts) {
+        if (it.value.session == session.serial && it.value.kind != HintScript::Activate)
+            it.value.kind = HintScript::Ignore;
+    }
+
+    if (how != HintSessionEnd::Silently) {
+        auto cancelled = message("hints_cancelled"sv);
+        cancelled.set("id"sv, session.id);
+        send(cancelled);
+        if (how == HintSessionEnd::PageGone)
+            return;
+    }
+
+    // NB: Scripts run in the order they are sent, so this one finds what the session's earlier ones left, in whichever
+    //     document they ran.
+    auto index = activate.has_value() ? static_cast<i64>(*activate) : -1;
+    run_hint_script(MUST(String::formatted("(function () {{ var hints = window[\"{}\"]; return hints ? hints.end({}) : null; }})()", session.name, index)),
+        activate.has_value() ? HintScript::Activate : HintScript::Ignore);
+}
+
+void EmacsWebView::did_end_hints(StringView json)
+{
+    auto answer = JsonValue::from_string(json);
+    if (answer.is_error() || !answer.value().is_object())
+        return;
+    auto const& object = answer.value().as_object();
+    if (object.get_string("action"sv) != "click"sv)
+        return;
+
+    auto x = number(object, "x"sv);
+    auto y = number(object, "y"sv);
+    if (!x.has_value() || !y.has_value() || !isfinite(*x) || !isfinite(*y))
+        return;
+
+    // NB: The page reports CSS pixels of its viewport, where the element is. A point outside the view is no point of it.
+    auto scale = m_device_pixel_ratio * zoom_level();
+    auto device_x = round(*x * scale);
+    auto device_y = round(*y * scale);
+    auto viewport = viewport_size().to_type<int>();
+    if (device_x < 0 || device_y < 0 || device_x >= viewport.width() || device_y >= viewport.height()) {
+        dbgln("Emacs: not clicking at {},{}, which is outside the view", device_x, device_y);
+        return;
+    }
+    click_at({ static_cast<int>(device_x), static_cast<int>(device_y) });
+}
+
+// A click as the user's mouse would make it, so that the page sees a trusted event with user activation.
+void EmacsWebView::click_at(Gfx::IntPoint position)
+{
+    enqueue_input_event(mouse_event(Web::MouseEvent::Type::MouseMove, position, MouseButton::None, MouseButton::None, KeyModifier::Mod_None));
+    auto down = mouse_event(Web::MouseEvent::Type::MouseDown, position, MouseButton::Primary, MouseButton::Primary, KeyModifier::Mod_None);
+    down.click_count = 1;
+    enqueue_input_event(move(down));
+    auto up = mouse_event(Web::MouseEvent::Type::MouseUp, position, MouseButton::Primary, MouseButton::None, KeyModifier::Mod_None);
+    up.click_count = 1;
+    enqueue_input_event(move(up));
 }
 
 Optional<u64> EmacsWebView::open_request(RequestKind kind, JsonObject request)
@@ -1794,10 +2466,22 @@ void EmacsServer::handle_control(JsonObject const& message)
     static constexpr Array commands = {
         "mouse"sv, "key"sv, "text"sv, "set_viewport"sv, "set_visibility"sv, "set_focus"sv, "load"sv, "load_html"sv,
         "reload"sv, "stop"sv, "history"sv, "zoom"sv, "find"sv, "find_step"sv, "edit"sv, "paste"sv,
-        "request_selection"sv, "screenshot"sv, "set_console"sv, "request_source"sv
+        "request_selection"sv, "screenshot"sv, "set_console"sv, "request_source"sv, "hints"sv, "hints_narrow"sv,
+        "hints_end"sv
     };
-    if (commands.contains_slow(type->bytes_as_string_view()))
+    if (type->starts_with_bytes("hints"sv) && commands.contains_slow(type->bytes_as_string_view())) {
+        // NB: An error that answers a hints message names the session it did.
+        JsonObject error;
+        error.set("type"sv, "error"sv);
+        if (view_id.has_value())
+            error.set("view"sv, *view_id);
+        error.set("message"sv, "unknown view"sv);
+        if (auto id = message.get("id"sv); id.has_value())
+            error.set("id"sv, *id);
+        send(error);
+    } else if (commands.contains_slow(type->bytes_as_string_view())) {
         send_error(view_id, "unknown view"sv);
+    }
 }
 
 void EmacsServer::handle_hello(JsonObject const& message)
@@ -1846,6 +2530,9 @@ void EmacsServer::handle_hello(JsonObject const& message)
     welcome.set("shm"sv, m_client.uses_shared_memory);
     welcome.set("log"sv, wire_text(EmacsTransport::log_path()));
     welcome.set("host"sv, move(host));
+    JsonArray features;
+    features.must_append("hints"sv);
+    welcome.set("features"sv, move(features));
     welcome.set("views"sv, move(views));
     send(welcome);
 

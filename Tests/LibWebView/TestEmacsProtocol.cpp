@@ -5,6 +5,9 @@
  */
 
 #include <AK/Endian.h>
+#include <AK/HashTable.h>
+#include <AK/Math.h>
+#include <AK/StringBuilder.h>
 #include <LibTest/TestCase.h>
 #include <LibWebView/EmacsProtocol.h>
 
@@ -195,4 +198,186 @@ TEST_CASE(mouse_buttons_and_cursors)
     EXPECT_EQ(css_cursor_name(Gfx::StandardCursor::IBeam), "text"sv);
     EXPECT_EQ(css_cursor_name(Gfx::StandardCursor::Arrow), "default"sv);
     EXPECT_EQ(css_cursor_name(Gfx::ImageCursor {}), "default"sv);
+}
+
+TEST_CASE(hint_alphabets)
+{
+    EXPECT(is_valid_hint_alphabet("ab"sv));
+    EXPECT(is_valid_hint_alphabet("asdfghjkl"sv));
+    EXPECT(is_valid_hint_alphabet("abcdefghijklmnopqrstuvwxyz0123456789"sv));
+    EXPECT(!is_valid_hint_alphabet(""sv));
+    EXPECT(!is_valid_hint_alphabet("a"sv));
+    EXPECT(!is_valid_hint_alphabet("aa"sv));
+    EXPECT(!is_valid_hint_alphabet("abca"sv));
+    EXPECT(!is_valid_hint_alphabet("aB"sv));
+    EXPECT(!is_valid_hint_alphabet("a-"sv));
+    EXPECT(!is_valid_hint_alphabet("a\""sv));
+    EXPECT(!is_valid_hint_alphabet("a\xc3\xa9"sv));
+    EXPECT(!is_valid_hint_alphabet("abcdefghijklmnopqrstuvwxyz0123456789a"sv));
+}
+
+TEST_CASE(hint_session_ids)
+{
+    EXPECT_EQ(hint_session_id(0), 0u);
+    EXPECT_EQ(hint_session_id(7), 7u);
+    EXPECT_EQ(hint_session_id(7.0), 7u);
+    EXPECT_EQ(hint_session_id(9007199254740991.0), 9007199254740991u);
+    EXPECT(!hint_session_id(9007199254740992.0).has_value());
+    EXPECT(!hint_session_id(NumericLimits<u64>::max()).has_value());
+    EXPECT(!hint_session_id(-1).has_value());
+    EXPECT(!hint_session_id(1.5).has_value());
+    EXPECT(!hint_session_id(AK::NaN<double>).has_value());
+    EXPECT(!hint_session_id("1"_string).has_value());
+    EXPECT(!hint_session_id(JsonValue {}).has_value());
+    EXPECT(!hint_session_id(true).has_value());
+    EXPECT(!hint_session_id(JsonObject {}).has_value());
+}
+
+TEST_CASE(hint_labels_have_the_shortest_common_length)
+{
+    EXPECT(hint_labels("ab"sv, 0).is_empty());
+    EXPECT_EQ(hint_labels("ab"sv, 1), (Vector<String> { "a"_string }));
+    EXPECT_EQ(hint_labels("ab"sv, 2), (Vector<String> { "a"_string, "b"_string }));
+    EXPECT_EQ(hint_labels("ab"sv, 3), (Vector<String> { "aa"_string, "ab"_string, "ba"_string }));
+    EXPECT_EQ(hint_labels("asd"sv, 4), (Vector<String> { "aa"_string, "as"_string, "ad"_string, "sa"_string }));
+
+    for (auto alphabet : { "ab"sv, "asdf"sv, "0123456789"sv, "abcdefghijklmnopqrstuvwxyz0123456789"sv }) {
+        for (size_t count : { 1uz, 2uz, 9uz, 10uz, 11uz, 100uz, 999uz, 1000uz }) {
+            auto labels = hint_labels(alphabet, count);
+            EXPECT_EQ(labels.size(), count);
+
+            size_t length = 1;
+            for (size_t capacity = alphabet.length(); capacity < count; capacity *= alphabet.length())
+                ++length;
+
+            HashTable<String> distinct;
+            for (auto const& label : labels) {
+                EXPECT_EQ(label.bytes().size(), length);
+                for (auto character : label.bytes())
+                    EXPECT(alphabet.contains(static_cast<char>(character)));
+                distinct.set(label);
+            }
+            EXPECT_EQ(distinct.size(), count);
+        }
+    }
+    EXPECT_EQ(hint_labels("ab"sv, 1000)[999], "bbbbbaabbb"_string);
+}
+
+TEST_CASE(hint_prefixes)
+{
+    EXPECT_EQ(hint_label_length(2, 1), 1u);
+    EXPECT_EQ(hint_label_length(2, 2), 1u);
+    EXPECT_EQ(hint_label_length(2, 3), 2u);
+    EXPECT_EQ(hint_label_length(2, 1000), 10u);
+    EXPECT_EQ(hint_label_length(36, 1000), 2u);
+
+    EXPECT(is_valid_hint_prefix(""sv, "asdf"sv, 2));
+    EXPECT(is_valid_hint_prefix("a"sv, "asdf"sv, 2));
+    EXPECT(is_valid_hint_prefix("df"sv, "asdf"sv, 2));
+    EXPECT(!is_valid_hint_prefix("aaa"sv, "asdf"sv, 2));
+    EXPECT(!is_valid_hint_prefix("q"sv, "asdf"sv, 2));
+    EXPECT(!is_valid_hint_prefix("A"sv, "asdf"sv, 2));
+    EXPECT(!is_valid_hint_prefix("\""sv, "asdf"sv, 2));
+}
+
+TEST_CASE(hint_label_masks)
+{
+    auto labels = hint_labels("asd"sv, 5);
+    EXPECT_EQ(hint_label_mask(labels, ""sv), "11111"_string);
+    EXPECT_EQ(hint_label_mask(labels, "a"sv), "11100"_string);
+    EXPECT_EQ(hint_label_mask(labels, "sa"sv), "00010"_string);
+    EXPECT_EQ(hint_label_mask(labels, "x"sv), "00000"_string);
+    EXPECT_EQ(hint_label_mask(labels, "saa"sv), "00000"_string);
+    EXPECT_EQ(hint_label_mask(labels, "\"); alert(1); (\""sv), "00000"_string);
+}
+
+TEST_CASE(hint_activation_indices)
+{
+    EXPECT_EQ(hint_activation_index(0, 3), 0u);
+    EXPECT_EQ(hint_activation_index(2, 3), 2u);
+    EXPECT_EQ(hint_activation_index(2.0, 3), 2u);
+    EXPECT(!hint_activation_index(3, 3).has_value());
+    EXPECT(!hint_activation_index(-1, 3).has_value());
+    EXPECT(!hint_activation_index(0.5, 3).has_value());
+    EXPECT(!hint_activation_index(AK::NaN<double>, 3).has_value());
+    EXPECT(!hint_activation_index(1e300, 3).has_value());
+    EXPECT(!hint_activation_index("0"_string, 3).has_value());
+    EXPECT(!hint_activation_index(JsonValue {}, 3).has_value());
+    EXPECT(!hint_activation_index(0, 0).has_value());
+}
+
+TEST_CASE(hint_collections_are_checked)
+{
+    EXPECT(parse_hint_collection("null"sv).is_error());
+    EXPECT(parse_hint_collection("[]"sv).is_error());
+    EXPECT(parse_hint_collection("{\"items\":7}"sv).is_error());
+    EXPECT(parse_hint_collection("{\"items\":["sv).is_error());
+
+    auto empty = MUST(parse_hint_collection("{\"items\":[]}"sv));
+    EXPECT(empty.items.is_empty());
+    EXPECT(!empty.truncated);
+
+    auto collection = MUST(parse_hint_collection(R"~({"items":[
+        {"kind":"link","text":"Home","url":"https://example.org/a/../b","x":1.5,"y":2,"width":30,"height":10},
+        {"kind":"button","text":"OK","url":"https://example.org/","x":"1","y":null,"width":1e400,"height":-1},
+        {"kind":"input","text":7},
+        {"kind":"evil","text":"x"},
+        {"kind":"link","url":"not a url"},
+        {"kind":"link","url":"javascript:alert(1)"},
+        "junk"
+    ]})~"sv));
+    VERIFY(collection.items.size() == 7);
+    EXPECT(!collection.truncated);
+
+    auto const& link = collection.items[0];
+    EXPECT(link.kind == HintKind::Link);
+    EXPECT_EQ(link.text, "Home"_string);
+    EXPECT_EQ(link.url, "https://example.org/b"_string);
+    EXPECT_EQ(link.x, 1.5);
+    EXPECT_EQ(link.y, 2.0);
+    EXPECT_EQ(link.width, 30.0);
+    EXPECT_EQ(link.height, 10.0);
+
+    auto const& button = collection.items[1];
+    EXPECT(button.kind == HintKind::Button);
+    EXPECT(!button.url.has_value());
+    EXPECT_EQ(button.x, 0.0);
+    EXPECT_EQ(button.y, 0.0);
+    EXPECT_EQ(button.height, -1.0);
+
+    EXPECT(collection.items[2].kind == HintKind::Input);
+    EXPECT(collection.items[2].text.is_empty());
+    EXPECT(collection.items[3].kind == HintKind::Other);
+    EXPECT(!collection.items[4].url.has_value());
+    EXPECT_EQ(collection.items[5].url, "javascript:alert(1)"_string);
+    EXPECT(collection.items[6].kind == HintKind::Other);
+    EXPECT_EQ(hint_kind_name(collection.items[6].kind), "other"sv);
+}
+
+TEST_CASE(hint_collections_are_bounded)
+{
+    StringBuilder json;
+    json.append("{\"items\":["sv);
+    for (size_t i = 0; i < maximum_hint_count + 5; ++i) {
+        if (i != 0)
+            json.append(',');
+        json.appendff("{{\"kind\":\"link\",\"text\":\"{}\",\"url\":\"https://example.org/{}\",\"x\":1e300}}", MUST(String::repeated('t', 300)), MUST(String::repeated('p', i == 0 ? maximum_hint_url_length : 10)));
+    }
+    json.append("]}"sv);
+
+    auto collection = MUST(parse_hint_collection(json.string_view()));
+    EXPECT_EQ(collection.items.size(), maximum_hint_count);
+    EXPECT(collection.truncated);
+    EXPECT_EQ(collection.items[0].text.bytes().size(), maximum_hint_text_length);
+    EXPECT(!collection.items[0].url.has_value());
+    EXPECT(collection.items[1].url.has_value());
+    EXPECT_EQ(collection.items[1].x, 1e9);
+
+    // Text is cut at a code point, and a lone surrogate becomes a replacement character.
+    StringBuilder text;
+    for (size_t i = 0; i < maximum_hint_text_length + 3; ++i)
+        text.append("\xc3\xa9"sv);
+    auto cut = MUST(parse_hint_collection(MUST(String::formatted("{{\"items\":[{{\"text\":\"{}\"}},{{\"text\":\"a\\ud800b\"}}]}}", text.string_view()))));
+    EXPECT_EQ(cut.items[0].text.bytes().size(), maximum_hint_text_length * 2);
+    EXPECT_EQ(cut.items[1].text, "a\uFFFDb"_string);
 }
