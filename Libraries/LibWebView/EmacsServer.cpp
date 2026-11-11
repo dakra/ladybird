@@ -120,12 +120,19 @@ EmacsServer::~EmacsServer()
     s_the_server = nullptr;
 }
 
-// NB: A download does not say which view it is of; with one view, it is that one's.
-void EmacsServer::did_block_download(StringView name)
+// NB: A download that is not a view's own, such as one of a window that is not shown, is the only view's if there is
+//     one view.
+void EmacsServer::did_block_download(StringView name, ViewImplementation const* requesting_view)
 {
     dbgln("Emacs: blocked the download of '{}'", name);
     if (!s_the_server)
         return;
+    for (auto& view : s_the_server->m_views) {
+        if (view.ptr() == requesting_view) {
+            view->did_block_download(name);
+            return;
+        }
+    }
     if (s_the_server->m_views.size() == 1) {
         s_the_server->m_views.first()->did_block_download(name);
         return;
@@ -246,11 +253,36 @@ void EmacsServer::view_did_close(Badge<EmacsWebView>, u32 view_id)
     });
 }
 
-EmacsWebView& EmacsServer::create_view(Web::DevicePixelSize size, double device_pixel_ratio)
+EmacsWebView& EmacsServer::create_view(Web::DevicePixelSize size, double device_pixel_ratio, Optional<CanonicalTraversable&> traversable)
 {
     VERIFY(m_views.size() < m_maximum_views);
-    m_views.append(EmacsWebView::create(m_theme, size, device_pixel_ratio, *this, m_next_view_id++));
+    m_views.append(EmacsWebView::create(m_theme, size, device_pixel_ratio, *this, m_next_view_id++, traversable));
     return *m_views.last();
+}
+
+EmacsWebView* EmacsServer::open_view(Badge<EmacsWebView>, EmacsWebView& opener, Optional<CanonicalTraversable&> traversable)
+{
+    if (!has_ready_client() || !m_client.takes_popups || m_views.size() >= m_maximum_views)
+        return nullptr;
+    if (viewport_area_left_for(nullptr) < opener.viewport_area())
+        return nullptr;
+
+    auto& view = create_view(opener.viewport_size(), opener.device_pixel_ratio(), traversable);
+    view.did_get_opened_by_page();
+    auto created = view.description();
+    created.set("type"sv, "view_created"sv);
+    created.set("opener"sv, opener.id());
+    send(created);
+    if (traversable.has_value()) {
+        view.client_changed();
+        return &view;
+    }
+    // NB: The caller loads a URL in a view for a tab once this returns, which the first state then tells.
+    Core::deferred_invoke([this, weak_view = view.make_weak_ptr<EmacsWebView>()] {
+        if (weak_view && has_ready_client())
+            weak_view->client_changed();
+    });
+    return &view;
 }
 
 void EmacsServer::remove_view(u32 view_id)
@@ -349,6 +381,7 @@ void EmacsServer::handle_hello(JsonObject const& message)
     }
     // NB: Only the client knows whether it runs on this machine.
     m_client.uses_shared_memory = message.get_bool("shm"sv).value_or(false);
+    m_client.takes_popups = message.get_bool("popups"sv).value_or(false);
     m_client.hello_done = true;
 
     dbgln("Emacs: client '{}' connected over {}", message.get_string("client"sv).value_or({}), m_transport->kind() == EmacsTransport::Kind::Stdio ? "stdio"sv : "a socket"sv);

@@ -2771,12 +2771,12 @@ static LexicalPath unique_download_path(ByteString const& downloads_directory, B
     }
 }
 
-ErrorOr<LexicalPath> Application::default_path_for_downloaded_file(ByteString const& file) const
+ErrorOr<LexicalPath> Application::default_path_for_downloaded_file(ByteString const& file, ViewImplementation const* view) const
 {
 #if !defined(AK_OS_WINDOWS)
     // The Emacs client is not asked where to save, so a page gets to save nothing.
     if (browser_options().headless_mode == HeadlessMode::Emacs) {
-        EmacsServer::did_block_download(Web::sanitize_suggested_download_filename(file));
+        EmacsServer::did_block_download(Web::sanitize_suggested_download_filename(file), view);
         return Error::from_errno(ECANCELED);
     }
 #endif

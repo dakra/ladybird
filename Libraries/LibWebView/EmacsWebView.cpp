@@ -167,11 +167,11 @@ static ErrorOr<ByteString> write_private_file(Optional<ByteString> const& path, 
     return written_path;
 }
 
-NonnullOwnPtr<EmacsWebView> EmacsWebView::create(Core::AnonymousBuffer theme, Web::DevicePixelSize viewport_size, double device_pixel_ratio, EmacsServer& server, u32 id)
+NonnullOwnPtr<EmacsWebView> EmacsWebView::create(Core::AnonymousBuffer theme, Web::DevicePixelSize viewport_size, double device_pixel_ratio, EmacsServer& server, u32 id, Optional<CanonicalTraversable&> traversable)
 {
     auto view = adopt_own(*new EmacsWebView(move(theme), viewport_size, device_pixel_ratio, server, id));
     // NB: A view renders only while a client is there to see it.
-    view->initialize_tab(Web::HTML::VisibilityState::Hidden);
+    view->initialize_tab(Web::HTML::VisibilityState::Hidden, traversable);
     view->set_presents_from_cpu_memory(true);
     return view;
 }
@@ -355,12 +355,7 @@ EmacsWebView::EmacsWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize vie
     };
 
     on_close = [this] {
-        withdraw_page_requests();
-        end_hint_session(HintSessionEnd::Cancelled);
-        auto closed = message("view_closed"sv);
-        closed.set("reason"sv, "closed"sv);
-        send(closed);
-        m_server.view_did_close({}, m_id);
+        close_for_page();
     };
 
     on_hints_collected = [this](WebContentPage& page, u64 request_id, JsonValue const& result) {
@@ -374,7 +369,9 @@ EmacsWebView::EmacsWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize vie
     };
 
     on_new_web_view = [this](auto, auto, CanonicalTraversable& traversable) {
-        // The page gets the window it asked for, which nobody is shown and which closes once its URL is known.
+        if (auto* view = m_server.open_view({}, *this, traversable))
+            return view->handle();
+        // Otherwise the page gets the window it asked for, which nobody is shown and which closes once its URL is known.
         auto& popup = adopt_child_web_view(HeadlessWebView::create_child(*this, traversable));
         watch_blocked_popup(popup);
         return popup.handle();
@@ -617,6 +614,19 @@ void EmacsWebView::send_held_messages()
 void EmacsWebView::did_block_download(StringView name)
 {
     send_error(wire_formatted("download blocked: {}", name));
+    // A window whose first navigation is a download has nothing to show.
+    if (m_opened_by_page && !m_active_document_id.has_value())
+        close_for_page();
+}
+
+void EmacsWebView::close_for_page()
+{
+    withdraw_page_requests();
+    end_hint_session(HintSessionEnd::Cancelled);
+    auto closed = message("view_closed"sv);
+    closed.set("reason"sv, "closed"sv);
+    send(closed);
+    m_server.view_did_close({}, m_id);
 }
 
 void EmacsWebView::send_error(StringView text)
@@ -2013,10 +2023,12 @@ void EmacsWebView::insert_clipboard_item(Web::Clipboard::SystemClipboardItem ite
     HeadlessWebView::insert_clipboard_item(move(item));
 }
 
-// What the page or the browser would open in a tab or window of its own is not shown. The client learns the URL, and
-// may open it in a view.
+// What the page or the browser would open in a tab or window of its own gets a view when the client takes those.
+// Otherwise it is not shown: the client learns the URL, and may open it in a view.
 ViewImplementation* EmacsWebView::create_view_for_new_tab_or_window(IsPrivate is_private)
 {
+    if (auto* opened = m_server.open_view({}, *this, {}))
+        return opened;
     auto* view = HeadlessWebView::create_view_for_new_tab_or_window(is_private);
     if (view)
         watch_blocked_popup(static_cast<HeadlessWebView&>(*view));

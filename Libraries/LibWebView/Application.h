@@ -336,7 +336,8 @@ public:
 
     virtual bool should_capture_web_content_output() const { return false; }
 
-    virtual ErrorOr<LexicalPath> default_path_for_downloaded_file(ByteString const& file) const;
+    // The view is the one whose page or user asked for the download, when there is one.
+    virtual ErrorOr<LexicalPath> default_path_for_downloaded_file(ByteString const& file, ViewImplementation const* = nullptr) const;
     NonnullRefPtr<Core::Promise<LexicalPath>> path_for_downloaded_file(ByteString const& file) const;
 
     virtual void display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const;

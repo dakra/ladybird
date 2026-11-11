@@ -48,7 +48,7 @@ public:
     void send_error(Optional<u32> view, StringView text, JsonValue request = {});
 
     // Pages save nothing in this mode, as the client is not asked where to. The client is told what was not saved.
-    static void did_block_download(StringView name);
+    static void did_block_download(StringView name, ViewImplementation const*);
 
     // The views take turns sending frames on the connection, as EmacsFrameTurns describes. A view that may not send
     // now is told when to ask again. A turn that was given is ended, whatever the view did with it.
@@ -72,11 +72,17 @@ public:
 
     void view_did_close(Badge<EmacsWebView>, u32 view_id);
 
+    // A view for a window a page of the opener opens, on the traversable the engine made for it, or for a tab, without
+    // a traversable. Returns null, making no view, unless the client takes views that pages open, the server has fewer
+    // than its maximum of views, and the other views leave room for one of the opener's size.
+    EmacsWebView* open_view(Badge<EmacsWebView>, EmacsWebView& opener, Optional<CanonicalTraversable&>);
+
 private:
     struct ClientState {
         bool hello_done { false };
         bool accepts_zstd { false };
         bool uses_shared_memory { false };
+        bool takes_popups { false };
     };
 
     EmacsServer(Core::AnonymousBuffer theme, NonnullOwnPtr<EmacsTransport>, size_t maximum_views);
@@ -87,7 +93,7 @@ private:
     void handle_close_view(JsonObject const&);
 
     EmacsWebView* view_with_id(Optional<u32>);
-    EmacsWebView& create_view(Web::DevicePixelSize, double device_pixel_ratio);
+    EmacsWebView& create_view(Web::DevicePixelSize, double device_pixel_ratio, Optional<CanonicalTraversable&> = {});
     void remove_view(u32 view_id);
     void connection_wrote();
     void client_went_away();

@@ -124,9 +124,9 @@ static ErrorOr<Vector<DevTools::DevToolsDelegate::StorageItem>> parse_storage_it
     return items;
 }
 
-static Optional<LexicalPath> choose_download_destination_or_report_error(URL::URL const& url, ByteString const& suggested_filename)
+static Optional<LexicalPath> choose_download_destination_or_report_error(Optional<ViewImplementation&> view, URL::URL const& url, ByteString const& suggested_filename)
 {
-    auto destination = Application::the().default_path_for_downloaded_file(suggested_filename);
+    auto destination = Application::the().default_path_for_downloaded_file(suggested_filename, view.ptr());
     if (destination.is_error()) {
         if (!destination.error().is_errno() || destination.error().code() != ECANCELED)
             Application::the().display_error_dialog(ByteString::formatted("Unable to download {}: {}", url, destination.error()));
@@ -2989,7 +2989,7 @@ void WebContentPage::did_destroy_child_frame(Web::HTML::CrossProcessId frame_id)
 
 Messages::WebContentClient::DidStartDownloadWithoutRequestResponse WebContentPage::did_start_download_without_request(URL::URL url, ByteString suggested_filename, Optional<u64> total_size)
 {
-    auto destination = choose_download_destination_or_report_error(url, suggested_filename);
+    auto destination = choose_download_destination_or_report_error(traversable().view(), url, suggested_filename);
     if (!destination.has_value())
         return { Optional<u64> {} };
 
@@ -3061,7 +3061,7 @@ Messages::WebContentClient::DidStartDownloadResponse WebContentPage::did_start_d
         return { Optional<u64> {} };
     }
 
-    auto destination = choose_download_destination_or_report_error(url, suggested_filename);
+    auto destination = choose_download_destination_or_report_error(traversable().view(), url, suggested_filename);
     if (!destination.has_value()) {
         if (on_response_finished)
             on_response_finished(0, nullptr,

@@ -33,7 +33,7 @@ public:
     // Tests cover elastic overscroll on every platform, whichever of them the browser enables it on.
     virtual bool platform_scrolls_elastically() const override { return true; }
 
-    virtual ErrorOr<LexicalPath> default_path_for_downloaded_file(ByteString const&) const override;
+    virtual ErrorOr<LexicalPath> default_path_for_downloaded_file(ByteString const&, WebView::ViewImplementation const*) const override;
 
     // Notifications go to a recording backend, which tests read through Internals; what a click would do to the
     // browser's windows is recorded there too.

@@ -138,7 +138,7 @@ void Application::create_platform_options(WebView::BrowserOptions& browser_optio
     }
 }
 
-ErrorOr<LexicalPath> Application::default_path_for_downloaded_file(ByteString const& file) const
+ErrorOr<LexicalPath> Application::default_path_for_downloaded_file(ByteString const& file, WebView::ViewImplementation const*) const
 {
     if (!downloads_directory.has_value())
         return Error::from_errno(ECANCELED);

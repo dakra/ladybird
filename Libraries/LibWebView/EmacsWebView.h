@@ -31,7 +31,7 @@ class EmacsServer;
 // become input and commands, and what a browser window would ask its user goes to the client as requests it answers.
 class WEBVIEW_API EmacsWebView final : public HeadlessWebView {
 public:
-    static NonnullOwnPtr<EmacsWebView> create(Core::AnonymousBuffer theme, Web::DevicePixelSize, double device_pixel_ratio, EmacsServer&, u32 id);
+    static NonnullOwnPtr<EmacsWebView> create(Core::AnonymousBuffer theme, Web::DevicePixelSize, double device_pixel_ratio, EmacsServer&, u32 id, Optional<CanonicalTraversable&> = {});
     virtual ~EmacsWebView() override;
 
     u32 id() const { return m_id; }
@@ -52,10 +52,12 @@ public:
     // The client has read some of what it was sent.
     void connection_wrote() { send_held_messages(); }
 
+    using HeadlessWebView::viewport_size;
     // How many device pixels the viewport has.
     i64 viewport_area() const { return static_cast<i64>(m_viewport_size.width().value()) * m_viewport_size.height().value(); }
 
     void did_block_download(StringView name);
+    void did_get_opened_by_page() { m_opened_by_page = true; }
 
     void handle_message(StringView type, JsonObject const&);
 
@@ -155,6 +157,8 @@ private:
     void send_latest(JsonObject);
     void send_held_messages();
     void send_error(StringView text);
+    // The page closed its view, or never showed anything in it.
+    void close_for_page();
 
     void schedule_state();
     void send_state();
@@ -220,6 +224,7 @@ private:
     // Whether a client has been told of the view, in a welcome or a view_created message. Until then nothing about the
     // view is sent.
     bool m_client_knows_view { false };
+    bool m_opened_by_page { false };
     // Whether the client wants the view shown, as it last said with set_visibility.
     bool m_visible_to_client { true };
     // Whether the view renders, which it does while it is visible to a client.
