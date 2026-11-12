@@ -2400,6 +2400,8 @@ void Node::recompute_editable_subtree_flags_and_repaint()
         return TraversalDecision::Continue;
     });
     document().page().keyboard_scroll_editability_changed(document());
+    if (auto focused = document().page().hosted_focused_navigable(); focused && focused->active_document().ptr() == &document())
+        document().page().client().page_did_change_focused_text_input_state();
     CSS::Invalidation::invalidate_style_after_focused_element_keyboard_input_change(document());
 }
 

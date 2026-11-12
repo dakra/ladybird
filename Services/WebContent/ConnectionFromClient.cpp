@@ -3396,6 +3396,7 @@ void ConnectionFromClient::paste(Web::PageId page_id, Utf16String text)
         if (auto navigable = page->page().hosted_focused_navigable())
             navigable->paste(text);
     }
+    update_input_method_state(page_id);
 }
 
 void ConnectionFromClient::paste_from_clipboard(Web::PageId page_id, Vector<Web::Clipboard::SystemClipboardItem> system_clipboard_data)
@@ -3404,6 +3405,7 @@ void ConnectionFromClient::paste_from_clipboard(Web::PageId page_id, Vector<Web:
         if (auto navigable = page->page().hosted_focused_navigable())
             navigable->paste_from_clipboard(system_clipboard_data);
     }
+    update_input_method_state(page_id);
 }
 
 void ConnectionFromClient::set_marked_text_from_input_method(Web::PageId page_id, Utf16String text)
@@ -3446,6 +3448,7 @@ void ConnectionFromClient::update_input_method_state(Web::PageId page_id)
     // Blocking there re-enters the run loop and can deadlock input-method server <-> UI <-> WebContent message flow.
     Optional<Web::DevicePixelRect> caret_rect;
     bool is_enabled = false;
+    bool has_transient_activation = false;
     i32 cursor_position = 0;
     i32 anchor_position = 0;
     Utf16String text_before_cursor;
@@ -3455,8 +3458,16 @@ void ConnectionFromClient::update_input_method_state(Web::PageId page_id)
     if (auto document = navigable ? navigable->active_document() : nullptr) {
         if (auto rect = document->current_caret_rect(); rect.has_value())
             caret_rect = page->page().enclosing_device_rect(*rect);
+        if (auto window = document->window())
+            has_transient_activation = window->has_transient_activation();
 
         if (auto const* text_control = as_if<Web::HTML::FormAssociatedTextControlElement>(document->focused_area().ptr())) {
+            auto const& html_element = text_control->text_control_to_html_element();
+            if (auto const* input_element = as_if<Web::HTML::HTMLInputElement>(html_element))
+                is_enabled = input_element->is_mutable() && input_element->has_selectable_text();
+            else if (auto const* text_area_element = as_if<Web::HTML::HTMLTextAreaElement>(html_element))
+                is_enabled = text_area_element->is_mutable();
+
             if (text_control->selection_start_binding().has_value()) {
                 auto value = text_control->relevant_value();
                 auto selection_start = text_control->selection_start();
@@ -3466,12 +3477,6 @@ void ConnectionFromClient::update_input_method_state(Web::PageId page_id)
                 auto value_length = value.length_in_code_units();
                 auto text_before_start = cursor > maximum_input_method_surrounding_text_length ? cursor - maximum_input_method_surrounding_text_length : 0;
                 auto text_after_length = min(value_length - cursor, maximum_input_method_surrounding_text_length);
-
-                auto const& html_element = text_control->text_control_to_html_element();
-                if (auto const* input_element = as_if<Web::HTML::HTMLInputElement>(html_element))
-                    is_enabled = input_element->is_mutable();
-                else if (auto const* text_area_element = as_if<Web::HTML::HTMLTextAreaElement>(html_element))
-                    is_enabled = text_area_element->is_mutable();
 
                 cursor_position = AK::clamp_to<i32>(cursor);
                 anchor_position = AK::clamp_to<i32>(anchor);
@@ -3506,7 +3511,7 @@ void ConnectionFromClient::update_input_method_state(Web::PageId page_id)
         }
     }
 
-    async_did_update_input_method_state(page_id, caret_rect, is_enabled, cursor_position, anchor_position, move(text_before_cursor), move(text_after_cursor));
+    async_did_update_input_method_state(page_id, caret_rect, is_enabled, has_transient_activation, cursor_position, anchor_position, move(text_before_cursor), move(text_after_cursor));
 }
 
 void ConnectionFromClient::set_content_blocking_policy(Web::PageId page_id, bool enabled, Vector<String> disabled_sites)
@@ -3648,8 +3653,10 @@ void ConnectionFromClient::set_has_focus(Web::PageId page_id, bool has_focus)
 
 void ConnectionFromClient::set_focused_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id)
 {
-    if (auto page = this->page(page_id); page.has_value())
+    if (auto page = this->page(page_id); page.has_value()) {
         page->page().focused_navigable_changed_in_another_page(navigable_id);
+        page->schedule_input_method_state_update();
+    }
 }
 
 void ConnectionFromClient::set_is_scripting_enabled(Web::PageId page_id, bool is_scripting_enabled)

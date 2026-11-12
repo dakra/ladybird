@@ -4302,6 +4302,8 @@ void Document::set_focused_area(GC::Ptr<Node> node, InvalidateFocusPseudoClasses
         spell_check_controller().did_focus(m_focused_area);
     if (m_writing_suggestion_controller)
         m_writing_suggestion_controller->did_focus(m_focused_area);
+
+    page().client().page_did_change_focused_text_input_state();
 }
 
 void Document::note_keyboard_interaction()

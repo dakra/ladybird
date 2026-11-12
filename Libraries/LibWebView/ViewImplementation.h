@@ -562,6 +562,9 @@ public:
     // position for placing IME overlays.
     struct InputMethodState {
         bool is_enabled { false };
+        // Whether the focused document's window had transient activation when this state was computed: a key or
+        // mouse press in it, or in a related frame, within the last few seconds.
+        bool has_transient_activation { false };
         i32 cursor_position { 0 };
         i32 anchor_position { 0 };
         Utf16String text_before_cursor;

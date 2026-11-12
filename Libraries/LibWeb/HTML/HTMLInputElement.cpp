@@ -1842,6 +1842,10 @@ void HTMLInputElement::form_associated_element_attribute_changed(Utf16FlyString 
 {
     PopoverTargetAttributes::associated_attribute_changed(name, value, namespace_);
 
+    // Whether a focused input takes text depends on these.
+    if ((name == HTML::AttributeNames::type || name == HTML::AttributeNames::readonly) && document().focused_area().ptr() == static_cast<DOM::Node const*>(this))
+        document().page().client().page_did_change_focused_text_input_state();
+
     if (name == HTML::AttributeNames::checked) {
         // https://html.spec.whatwg.org/multipage/input.html#the-input-element:concept-input-checked-dirty-2
         // When the checked content attribute is added, if the control does not have dirty checkedness, the user agent must set the checkedness of the element to true;

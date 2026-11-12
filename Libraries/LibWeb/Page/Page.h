@@ -947,6 +947,7 @@ public:
     virtual void page_did_set_session_history_entry_document_state_reload_pending([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] Utf16String const& navigation_api_key, [[maybe_unused]] bool reload_pending) { }
     virtual void page_did_request_set_system_focus([[maybe_unused]] bool has_system_focus) { }
     virtual void page_did_change_focused_navigable([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
+    virtual void page_did_change_focused_text_input_state() { }
     virtual void page_did_request_key_event_for_testing([[maybe_unused]] Web::KeyEvent event) { }
     virtual void page_did_request_spelling_menu_action_for_testing([[maybe_unused]] SpellingMenuActionForTesting action, [[maybe_unused]] u32 guess_index) { }
     virtual void page_did_request_webdriver_mouse_event([[maybe_unused]] HTML::CrossProcessId local_root_id, [[maybe_unused]] Web::MouseEvent event, GC::Ref<GC::Function<void()>> on_handled) { on_handled->function()(); }

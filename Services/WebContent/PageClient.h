@@ -177,6 +177,7 @@ public:
     void schedule_accessibility_tree_update();
     // Sends the UI process what changed in the accessibility tree since the last tree sent, or the whole tree.
     void publish_accessibility_tree(bool whole_tree_requested);
+    void schedule_input_method_state_update();
 
 private:
     struct PendingDOMMutation {
@@ -336,6 +337,7 @@ private:
     virtual void page_did_set_session_history_entry_document_state_reload_pending(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_api_key, bool reload_pending) override;
     virtual void page_did_request_set_system_focus(bool) override;
     virtual void page_did_change_focused_navigable(Web::HTML::CrossProcessId) override;
+    virtual void page_did_change_focused_text_input_state() override;
     virtual void page_did_request_key_event_for_testing(Web::KeyEvent) override;
     virtual void page_did_request_webdriver_mouse_event(Web::HTML::CrossProcessId local_root_id, Web::MouseEvent, GC::Ref<GC::Function<void()>> on_handled) override;
     virtual void page_did_request_pinch_event_for_testing(Web::HTML::CrossProcessId local_root_id, Web::PinchEvent const&) override;
@@ -479,6 +481,7 @@ private:
     bool m_has_focus { true };
     bool m_is_closed { false };
     bool m_did_start_using_gamepads { false };
+    bool m_input_method_state_update_scheduled { false };
 
     Web::CSS::PreferredColorScheme m_preferred_color_scheme { Web::CSS::PreferredColorScheme::Auto };
     bool m_screen_shows_high_dynamic_range { false };

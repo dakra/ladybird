@@ -30,6 +30,7 @@
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/TagNames.h>
+#include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/Namespace.h>
@@ -180,11 +181,10 @@ static bool is_link(Web::DOM::Element const& element)
 
 static bool is_text_field(Web::DOM::Element const& element)
 {
-    using enum Web::HTML::HTMLInputElement::TypeAttributeState;
-    if (is<Web::HTML::HTMLTextAreaElement>(element))
-        return true;
+    if (auto const* text_area = as_if<Web::HTML::HTMLTextAreaElement>(element))
+        return text_area->is_mutable();
     if (auto const* input = as_if<Web::HTML::HTMLInputElement>(element))
-        return first_is_one_of(input->type_state(), Text, Search, Telephone, URL, Email, Password, Number);
+        return input->is_mutable() && input->has_selectable_text();
     return element.is_editing_host();
 }
 
@@ -831,8 +831,12 @@ JsonValue prepare_activation(Web::Page& page, UniqueNodeID node_id)
         return answer;
 
     if (is_text_field(*element)) {
+        // The user chose the field, as with a click.
+        Web::HTML::Window::run_activation_notification_steps(element->document());
         Web::HTML::run_focusing_steps(element, nullptr, Web::HTML::FocusTrigger::Other, Web::HTML::ScrollIntoView::No);
         place_caret(*element);
+        // A field that had the focus already is not focused again, and its state now carries the activation.
+        page.client().page_did_change_focused_text_input_state();
         answer.set("action"sv, "focus"sv);
         return answer;
     }

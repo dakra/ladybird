@@ -254,6 +254,7 @@ EmacsWebView::EmacsWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize vie
         auto const& state = input_method_state();
         auto ime = message("ime"sv);
         ime.set("enabled"sv, state.is_enabled);
+        ime.set("activation"sv, state.has_transient_activation);
         if (state.caret_rect.has_value()) {
             JsonObject caret;
             caret.set("x"sv, state.caret_rect->x().value());
@@ -692,6 +693,14 @@ void EmacsWebView::send_state()
     send_latest(move(state));
 }
 
+// A new client, or a view that gets the focus again, is sent the state even when it repeats the last one sent.
+void EmacsWebView::resend_input_method_state()
+{
+    m_last_sent_input_method_state = {};
+    if (on_input_method_state_change)
+        on_input_method_state_change();
+}
+
 void EmacsWebView::client_went_away()
 {
     // The labels were for the client that asked for them.
@@ -759,8 +768,8 @@ void EmacsWebView::client_changed()
     update_visibility();
     m_last_sent_state = {};
     m_last_sent_background_color.clear();
-    m_last_sent_input_method_state = {};
     send_state();
+    resend_input_method_state();
     if (auto color = page_background_color(); color.alpha() != 0)
         on_page_background_color_change(color);
     for (auto const& request : m_open_requests) {
@@ -1018,7 +1027,10 @@ void EmacsWebView::handle_message(StringView type, JsonObject const& object)
         m_visible_to_client = object.get_bool("visible"sv).value_or(true);
         update_visibility();
     } else if (type == "set_focus"sv) {
-        set_has_system_focus(object.get_bool("focused"sv).value_or(true));
+        auto focused = object.get_bool("focused"sv).value_or(true);
+        set_has_system_focus(focused);
+        if (focused)
+            resend_input_method_state();
     } else if (type == "load"sv) {
         handle_load(object);
     } else if (type == "load_html"sv) {

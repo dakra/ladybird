@@ -605,8 +605,11 @@ void PageClient::did_handle_input_event(Web::PageId page_id, Web::InputEvent con
             return false;
         });
 
-    if (should_update_input_method_state)
+    if (should_update_input_method_state) {
+        // This push makes a pending one unnecessary, and keeps the state ahead of the event's finish.
+        m_input_method_state_update_scheduled = false;
         client().update_input_method_state(page_id);
+    }
 }
 
 void PageClient::report_finished_handling_input_event(Web::PageId page_id, u64 event_id, Web::EventResult event_was_handled)
@@ -1052,6 +1055,7 @@ void PageClient::page_did_request_external_url(URL::URL const& url, URL::Origin 
 void PageClient::page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document& document)
 {
     clear_pending_dom_mutations();
+    schedule_input_method_state_update();
 
     if (m_web_ui && &m_web_ui->document() != &document)
         m_web_ui.clear();
@@ -1066,6 +1070,7 @@ void PageClient::page_did_change_active_document_in_top_level_browsing_context(W
 
 void PageClient::page_did_change_active_document_in_child_navigable(Web::DOM::Document& document)
 {
+    schedule_input_method_state_update();
     // An iframe's document logs to the tab's console too.
     (void)attach_js_console(document);
 }
@@ -1902,6 +1907,28 @@ void PageClient::page_did_request_set_system_focus(bool has_system_focus)
 void PageClient::page_did_change_focused_navigable(Web::HTML::CrossProcessId navigable_id)
 {
     client().async_did_change_focused_navigable(m_id, navigable_id);
+    schedule_input_method_state_update();
+}
+
+void PageClient::page_did_change_focused_text_input_state()
+{
+    schedule_input_method_state_update();
+}
+
+// Sends the input-method state once the current event loop pass is done, so a burst of focus and editability changes
+// sends one update and the caret rect's layout is not forced inside the focusing steps.
+void PageClient::schedule_input_method_state_update()
+{
+    if (m_input_method_state_update_scheduled || m_is_closed)
+        return;
+    m_input_method_state_update_scheduled = true;
+    Web::Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *this }), [](auto& page_client) {
+        if (!page_client->m_input_method_state_update_scheduled)
+            return;
+        page_client->m_input_method_state_update_scheduled = false;
+        if (!page_client->m_is_closed)
+            page_client->client().update_input_method_state(page_client->m_id);
+    }));
 }
 
 void PageClient::page_did_request_key_event_for_testing(Web::KeyEvent event)

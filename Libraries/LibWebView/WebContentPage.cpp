@@ -2195,7 +2195,7 @@ void WebContentPage::relay_finished_input_event(WebContentPage const& reporting_
     }
 }
 
-void WebContentPage::did_update_input_method_state(Optional<Web::DevicePixelRect> caret_rect, bool is_enabled, i32 cursor_position, i32 anchor_position, Utf16String text_before_cursor, Utf16String text_after_cursor)
+void WebContentPage::did_update_input_method_state(Optional<Web::DevicePixelRect> caret_rect, bool is_enabled, bool has_transient_activation, i32 cursor_position, i32 anchor_position, Utf16String text_before_cursor, Utf16String text_after_cursor)
 {
 
     // The page hosting the tab's focused navigable describes its text input, in the viewport of its local root.
@@ -2205,7 +2205,7 @@ void WebContentPage::did_update_input_method_state(Optional<Web::DevicePixelRect
         return;
     if (caret_rect.has_value())
         caret_rect->translate_by(traversable.focused_navigable_host_offset());
-    view().set_input_method_state({}, { is_enabled, cursor_position, anchor_position, move(text_before_cursor), move(text_after_cursor), caret_rect });
+    view().set_input_method_state({}, { is_enabled, has_transient_activation, cursor_position, anchor_position, move(text_before_cursor), move(text_after_cursor), caret_rect });
 }
 
 void WebContentPage::did_change_theme_color(Gfx::Color color)

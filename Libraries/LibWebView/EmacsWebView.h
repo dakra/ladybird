@@ -162,6 +162,7 @@ private:
 
     void schedule_state();
     void send_state();
+    void resend_input_method_state();
     void update_visibility();
     // Ends a frame that was being sent in bands; the view's next frame is a whole one.
     void stop_sending_frame();

@@ -26,6 +26,7 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Namespace.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/InputEvent.h>
 #include <LibWebCommon/Infra/Strings.h>
@@ -488,6 +489,10 @@ void HTMLTextAreaElement::children_changed(ChildrenChangedMetadata const& metada
 
 void HTMLTextAreaElement::form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const&)
 {
+    // Whether a focused textarea takes text depends on it.
+    if (name == HTML::AttributeNames::readonly && document().focused_area().ptr() == static_cast<DOM::Node const*>(this))
+        document().page().client().page_did_change_focused_text_input_state();
+
     if (name == HTML::AttributeNames::placeholder) {
         if (m_placeholder_text_node)
             m_placeholder_text_node->set_data(value.has_value() ? value->utf16_view() : u""sv);

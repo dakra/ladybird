@@ -82,6 +82,7 @@ struct WebView::SitePermissionRow {
 [ExistingCpp]
 struct WebView::ViewImplementation::InputMethodState {
     bool is_enabled;
+    bool has_transient_activation;
     i32 cursor_position;
     i32 anchor_position;
     Utf16String text_before_cursor;
