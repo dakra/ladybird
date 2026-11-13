@@ -183,10 +183,10 @@ ErrorOr<size_t> sendto(int sockfd, ReadonlyBytes, int flags, struct sockaddr con
 CORE_API ErrorOr<size_t> recv(int sockfd, Bytes, int flags);
 ErrorOr<size_t> recvmsg(int sockfd, struct msghdr*, int flags);
 ErrorOr<size_t> recvfrom(int sockfd, Bytes, int flags, struct sockaddr*, socklen_t*);
-ErrorOr<void> getsockopt(int sockfd, int level, int option, void* value, socklen_t* value_size);
+CORE_API ErrorOr<void> getsockopt(int sockfd, int level, int option, void* value, socklen_t* value_size);
 CORE_API ErrorOr<void> setsockopt(int sockfd, int level, int option, void const* value, socklen_t value_size);
-ErrorOr<void> getsockname(int sockfd, struct sockaddr*, socklen_t*);
-ErrorOr<void> getpeername(int sockfd, struct sockaddr*, socklen_t*);
+CORE_API ErrorOr<void> getsockname(int sockfd, struct sockaddr*, socklen_t*);
+CORE_API ErrorOr<void> getpeername(int sockfd, struct sockaddr*, socklen_t*);
 CORE_API ErrorOr<void> socketpair(int domain, int type, int protocol, int sv[2]);
 CORE_API ErrorOr<void> set_socket_blocking(int socket, bool enabled);
 ErrorOr<AddressInfoVector> getaddrinfo(char const* nodename, char const* servname, struct addrinfo const& hints);

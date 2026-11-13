@@ -314,6 +314,8 @@ NO_SANITIZE_ADDRESS static int spawned_child_main(void* argument)
 
     if (context.options.new_process_group && setpgid(0, 0) < 0)
         report_errno_and_exit(errno);
+    if (context.options.new_session && setsid() < 0)
+        report_errno_and_exit(errno);
 
     if (auto error = run_file_actions_in_child(context.options.file_actions); error.has_value())
         report_errno_and_exit(error.value());
@@ -409,6 +411,8 @@ static ErrorOr<pid_t> fork_and_exec(ProcessSpawnOptions const& options, Span<cha
 
 ErrorOr<Process> Process::spawn(ProcessSpawnOptions const& options)
 {
+    VERIFY(!options.new_process_group || !options.new_session);
+
     ArgvList argv_list(options.executable, options.arguments.size());
     for (auto const& argument : options.arguments)
         argv_list.append(argument.characters());
@@ -442,6 +446,14 @@ ErrorOr<Process> Process::spawn(ProcessSpawnOptions const& options)
         CHECK(pthread_sigmask(SIG_SETMASK, nullptr, &signal_mask));
         sigaddset(&signal_mask, SIGTTOU);
         CHECK(posix_spawnattr_setsigmask(&spawn_attributes, &signal_mask));
+    }
+
+    if (options.new_session) {
+#if defined(POSIX_SPAWN_SETSID)
+        spawn_flags |= POSIX_SPAWN_SETSID;
+#else
+        return Error::from_errno(ENOTSUP);
+#endif
     }
 
 #if defined(AK_OS_MACOS)

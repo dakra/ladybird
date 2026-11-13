@@ -6,27 +6,46 @@
 
 #include <AK/JsonValue.h>
 #include <AK/NeverDestroyed.h>
+#include <AK/ScopeGuard.h>
 #include <AK/Time.h>
+#include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Notifier.h>
+#include <LibCore/Process.h>
 #include <LibCore/System.h>
 #include <LibCore/Timer.h>
 #include <LibWebView/EmacsTransport.h>
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
+#if defined(AK_OS_MACOS)
+#    include <launch.h>
+#endif
+
 namespace WebView {
 
 static int s_stream_in_fd = -1;
 static int s_stream_out_fd = -1;
+static int s_starter_fd = -1;
 static NeverDestroyed<ByteString> s_log_path;
+// The directory of the default socket, once default_socket_path() has made sure of it.
+static NeverDestroyed<Optional<ByteString>> s_default_socket_directory;
+
+// The socket that take_over_stdio() listens on, until the transport takes it.
+static int s_listen_fd = -1;
+static NeverDestroyed<ByteString> s_socket_path;
+static dev_t s_socket_device = 0;
+static ino_t s_socket_inode = 0;
 
 // A client that reads nothing while this much waits for it is taken to be stuck.
 static constexpr size_t maximum_queued_bytes = 256 * MiB;
@@ -35,6 +54,10 @@ static constexpr size_t maximum_pending_connections = 8;
 static constexpr int listen_backlog = 32;
 // How long a connection that is being closed gets to read its last message.
 static constexpr auto drain_timeout = AK::Duration::from_seconds(3);
+// How long a server waits for another one that is starting on the same socket path.
+static constexpr auto socket_lock_timeout = AK::Duration::from_seconds(10);
+// How long a process that starts a server in the background waits for it.
+static constexpr auto background_start_timeout = AK::Duration::from_seconds(60);
 
 static ErrorOr<void> set_nonblocking_and_close_on_exec(int fd)
 {
@@ -84,17 +107,111 @@ static ssize_t write_without_sigpipe(int fd, ReadonlyBytes bytes, [[maybe_unused
 #endif
 }
 
-ErrorOr<void> EmacsTransport::take_over_stdio(Kind kind, Optional<ByteString> const& log_path)
+// Each message to the starter ends in a NUL, which no path and no error message contains.
+static void tell_starter(StringView message)
 {
+    auto record = ByteString::formatted("{}\0", message);
+    auto bytes = record.bytes();
+    while (s_starter_fd >= 0 && !bytes.is_empty()) {
+        auto written = write_without_sigpipe(s_starter_fd, bytes, false);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            return;
+        bytes = bytes.slice(written);
+    }
+}
+
+// $XDG_RUNTIME_DIR without trailing slashes, unless it is unset, empty or relative.
+static Optional<ByteString> runtime_directory()
+{
+    auto directory = Core::Environment::get("XDG_RUNTIME_DIR"sv);
+    if (!directory.has_value() || !directory->starts_with('/'))
+        return {};
+    return directory->trim("/"sv, TrimMode::Right);
+}
+
+// $TMPDIR without trailing slashes, or /tmp where it is unset, empty or relative.
+static ByteString temporary_directory()
+{
+    auto directory = Core::Environment::get("TMPDIR"sv);
+    if (!directory.has_value() || !directory->starts_with('/'))
+        return "/tmp"sv;
+    return directory->trim("/"sv, TrimMode::Right);
+}
+
+static ByteString default_socket_directory()
+{
+    if (auto directory = runtime_directory(); directory.has_value())
+        return directory.release_value();
+    return ByteString::formatted("{}/ladybird-emacs-{}", temporary_directory(), getuid());
+}
+
+// Says on stderr, and to the process that waits for a server started in the background, what failed and why.
+static Error report_error(StringView context, Error error)
+{
+    auto message = ByteString::formatted("{}: {}", context, error);
+    warnln("{}", message);
+    EmacsTransport::notify_starter(ByteString::formatted("Unable to start the Emacs server: {}", message));
+    return error;
+}
+
+// NB: Anyone can put a file or a link at a name in /tmp, so the log there has a name nobody can tell beforehand.
+static ErrorOr<int> open_temporary_log()
+{
+    auto pattern = ByteString::formatted("/tmp/ladybird-emacs-{}-XXXXXX.log", getpid());
+    Vector<char> name;
+    name.append(pattern.characters(), pattern.length() + 1);
+    auto fd = ::mkstemps(name.data(), 4);
+    if (fd < 0)
+        return report_error(ByteString::formatted("Unable to open the log {}", pattern), Error::from_syscall("mkstemps"sv, errno));
+    *s_log_path = name.data();
+    TRY(Core::System::fcntl(fd, F_SETFD, FD_CLOEXEC));
+    return fd;
+}
+
+// The default log is in a directory that only the user can write to where there is one: that of the default socket
+// when the server listens there, else $XDG_RUNTIME_DIR. Where it cannot be opened there, it is in /tmp.
+static ErrorOr<int> open_default_log()
+{
+    auto directory = s_default_socket_directory->has_value() ? *s_default_socket_directory : runtime_directory();
+    if (!directory.has_value())
+        return open_temporary_log();
+
+    auto path = ByteString::formatted("{}/ladybird-emacs-{}.log", *directory, getpid());
+    (void)::unlink(path.characters());
+    auto fd = Core::System::open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd.is_error())
+        return open_temporary_log();
+    *s_log_path = move(path);
+    return fd.release_value();
+}
+
+ErrorOr<void> EmacsTransport::take_over_stdio(Kind kind, Optional<ByteString> const& socket_path, Optional<ByteString> const& log_path)
+{
+    if (kind == Kind::Socket) {
+        if (socket_path.has_value())
+            TRY(listen(*socket_path));
+        else
+            TRY(take_activated_socket());
+    }
+    ArmedScopeGuard stop_listening = [&] {
+        if (s_listen_fd < 0)
+            return;
+        ::close(exchange(s_listen_fd, -1));
+        if (!s_socket_path->is_empty())
+            (void)::unlink(s_socket_path->characters());
+    };
+
     int log_fd = -1;
     if (log_path.has_value()) {
         *s_log_path = *log_path;
-        log_fd = TRY(Core::System::open(*s_log_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600));
+        auto fd = Core::System::open(*s_log_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (fd.is_error())
+            return report_error(ByteString::formatted("Unable to open the log {}", *s_log_path), fd.release_error());
+        log_fd = fd.release_value();
     } else {
-        // NB: Anyone can put a file or a link at a name in /tmp, so the log is a file this process creates there.
-        *s_log_path = ByteString::formatted("/tmp/ladybird-emacs-{}.log", getpid());
-        (void)::unlink(s_log_path->characters());
-        log_fd = TRY(Core::System::open(*s_log_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
+        log_fd = TRY(open_default_log());
     }
 
     if (kind == Kind::Stdio) {
@@ -105,6 +222,7 @@ ErrorOr<void> EmacsTransport::take_over_stdio(Kind kind, Optional<ByteString> co
     } else {
         auto message = ByteString::formatted("Ladybird logs to {}\n", *s_log_path);
         (void)Core::System::write(STDERR_FILENO, message.bytes());
+        tell_starter(ByteString::formatted("log {}", *s_log_path));
     }
 
     // Helper processes inherit these, so what any of them prints goes to the log rather than into the stream.
@@ -113,6 +231,7 @@ ErrorOr<void> EmacsTransport::take_over_stdio(Kind kind, Optional<ByteString> co
         return Error::from_syscall("dup2"sv, errno);
     TRY(Core::System::close(null_fd));
     TRY(Core::System::close(log_fd));
+    stop_listening.disarm();
     return {};
 }
 
@@ -121,14 +240,229 @@ ByteString const& EmacsTransport::log_path()
     return *s_log_path;
 }
 
-ErrorOr<NonnullOwnPtr<EmacsTransport>> EmacsTransport::create(Kind kind, Optional<ByteString> const& socket_path)
+// Anyone may create names in the temporary directory, so the default socket there is in a directory that only the user
+// can enter, in a directory where nobody else can rename it. A directory that fails is refused rather than repaired.
+static ErrorOr<void> make_private_directory(ByteString const& path, StringView parent_path)
+{
+    auto parent = TRY(Core::System::stat(parent_path));
+    if (parent.st_uid != 0 && parent.st_uid != getuid())
+        return Error::from_string_literal("The directory of the default Emacs socket is in a directory of another user");
+    if ((parent.st_mode & (S_IWGRP | S_IWOTH)) != 0 && (parent.st_mode & S_ISVTX) == 0)
+        return Error::from_string_literal("The directory of the default Emacs socket is in a directory that others can write to");
+
+    // NB: The mode given to mkdir() is limited by the umask.
+    if (auto made = Core::System::mkdir(path, 0700); !made.is_error())
+        TRY(Core::System::chmod(path, 0700));
+    else if (made.error().code() != EEXIST)
+        return made.release_error();
+
+    auto directory = TRY(Core::System::lstat(path));
+    if (S_ISLNK(directory.st_mode))
+        return Error::from_string_literal("The directory of the default Emacs socket is a symbolic link");
+    if (!S_ISDIR(directory.st_mode))
+        return Error::from_string_literal("The directory of the default Emacs socket exists and is not a directory");
+    if (directory.st_uid != getuid())
+        return Error::from_string_literal("The directory of the default Emacs socket belongs to another user");
+    if ((directory.st_mode & 077) != 0)
+        return Error::from_string_literal("The directory of the default Emacs socket grants permissions to its group or others");
+    return {};
+}
+
+ErrorOr<ByteString> EmacsTransport::default_socket_path()
+{
+    auto directory = default_socket_directory();
+    auto socket_path = ByteString::formatted("{}/ladybird-emacs.sock", directory);
+    if (auto valid = validate_socket_path(socket_path); valid.is_error())
+        return report_error(ByteString::formatted("Unable to use {} as the default Emacs socket", socket_path), valid.release_error());
+
+    if (!runtime_directory().has_value()) {
+        auto temporary = temporary_directory();
+        if (auto result = make_private_directory(directory, temporary.is_empty() ? "/"sv : temporary.view()); result.is_error())
+            return report_error(ByteString::formatted("Unable to use {} for the default Emacs socket", directory), result.release_error());
+    }
+    *s_default_socket_directory = move(directory);
+    return socket_path;
+}
+
+ErrorOr<void> EmacsTransport::validate_socket_path(StringView socket_path)
+{
+    if (socket_path.is_empty())
+        return Error::from_string_literal("The Emacs socket path is empty");
+    if (socket_path.length() >= sizeof(sockaddr_un::sun_path))
+        return Error::from_string_literal("The Emacs socket path is longer than a Unix socket address can hold");
+    return {};
+}
+
+// Moves a descriptor above the standard streams, so that giving the server its standard streams cannot replace it.
+static ErrorOr<int> move_above_standard_streams(int fd)
+{
+    if (fd > STDERR_FILENO)
+        return fd;
+    auto moved_fd = TRY(Core::System::fcntl(fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1));
+    TRY(Core::System::close(fd));
+    return moved_fd;
+}
+
+ErrorOr<int> EmacsTransport::start_in_background(ReadonlySpan<StringView> arguments)
+{
+    auto pipe_fds = TRY(Core::System::pipe2(O_CLOEXEC));
+    auto read_fd = TRY(move_above_standard_streams(pipe_fds[0]));
+    auto write_fd = TRY(move_above_standard_streams(pipe_fds[1]));
+    ScopeGuard close_read_end = [&] { (void)Core::System::close(read_fd); };
+
+    Vector<ByteString> server_arguments;
+    for (auto argument : arguments.slice(1))
+        server_arguments.append(argument);
+
+    // NB: The pipe is named in the environment rather than among the arguments, where after a "--" it would be a URL.
+    Vector<ByteString> environment;
+    for (auto** variable = Core::Environment::raw_environ(); *variable; ++variable) {
+        auto entry = Core::Environment::Entry::from_chars(*variable);
+        if (entry.name != starter_fd_variable)
+            environment.append(entry.full_entry);
+    }
+    environment.append(ByteString::formatted("{}={}", starter_fd_variable, write_fd));
+
+    // NB: The server must not hold on to our standard streams, or whoever reads them would wait for it to exit.
+    auto server_or_error = Core::Process::spawn({
+        .executable = TRY(Core::System::current_executable_path()),
+        .new_session = true,
+        .arguments = server_arguments,
+        .environment = move(environment),
+        .file_actions = {
+            Core::FileAction::OpenFile { .path = "/dev/null", .mode = Core::File::OpenMode::Read, .fd = STDIN_FILENO },
+            Core::FileAction::OpenFile { .path = "/dev/null", .mode = Core::File::OpenMode::Write, .fd = STDOUT_FILENO },
+            Core::FileAction::OpenFile { .path = "/dev/null", .mode = Core::File::OpenMode::Write, .fd = STDERR_FILENO },
+            Core::FileAction::DupFd { .write_fd = write_fd, .fd = write_fd },
+        },
+    });
+    (void)Core::System::close(write_fd);
+    auto server = TRY(move(server_or_error));
+
+    // The server says where it logs to, then that it is ready or why it failed, and closes the pipe.
+    ByteBuffer report;
+    auto deadline = MonotonicTime::now() + background_start_timeout;
+    bool timed_out = false;
+    for (;;) {
+        auto remaining = deadline - MonotonicTime::now();
+        if (remaining <= AK::Duration::zero()) {
+            timed_out = true;
+            break;
+        }
+        struct pollfd poll_fd { .fd = read_fd, .events = POLLIN, .revents = 0 };
+        auto ready_count = Core::System::poll({ &poll_fd, 1 }, static_cast<int>(remaining.to_milliseconds()) + 1);
+        if (ready_count.is_error() && ready_count.error().code() == EINTR)
+            continue;
+        if (TRY(move(ready_count)) == 0)
+            continue;
+
+        u8 buffer[1024];
+        auto read_bytes = TRY(Core::System::read(read_fd, { buffer, sizeof(buffer) }));
+        if (read_bytes == 0)
+            break;
+        report.append(buffer, read_bytes);
+    }
+
+    Optional<StringView> server_log_path;
+    for (auto message : StringView { report.bytes() }.split_view('\0')) {
+        if (message.starts_with("log "sv)) {
+            server_log_path = message.substring_view(4);
+        } else if (message == "ready"sv) {
+            if (server_log_path.has_value())
+                warnln("Ladybird logs to {}", *server_log_path);
+            return 0;
+        } else if (message.starts_with("error "sv)) {
+            warnln("{}", message.substring_view(6));
+            return 1;
+        }
+    }
+
+    auto log_note = server_log_path.has_value() ? ByteString::formatted(", see {}", *server_log_path) : ByteString {};
+    if (timed_out) {
+        (void)Core::System::kill(server.pid(), SIGTERM);
+        warnln("The Emacs server did not start within {} s and was stopped{}", background_start_timeout.to_seconds(), log_note);
+        return 1;
+    }
+    auto status = TRY(server.wait_for_termination());
+    warnln("The Emacs server ended with status {} before it accepted connections{}", status, log_note);
+    return 1;
+}
+
+ErrorOr<bool> EmacsTransport::take_starter_fd()
+{
+    auto value = Core::Environment::get(starter_fd_variable);
+    if (!value.has_value())
+        return false;
+    auto fd = value->to_number<int>();
+    TRY(Core::Environment::unset(starter_fd_variable));
+    if (!fd.has_value() || *fd <= STDERR_FILENO)
+        return Error::from_string_literal("The pipe to the process that starts the Emacs server is not a valid descriptor");
+
+    TRY(Core::System::fcntl(*fd, F_SETFD, FD_CLOEXEC));
+#if defined(F_SETNOSIGPIPE)
+    TRY(Core::System::fcntl(*fd, F_SETNOSIGPIPE, 1));
+#endif
+    s_starter_fd = *fd;
+    return true;
+}
+
+void EmacsTransport::notify_starter(Optional<ByteString> const& failure)
+{
+    if (s_starter_fd < 0)
+        return;
+    if (failure.has_value())
+        tell_starter(ByteString::formatted("error {}", *failure));
+    else
+        tell_starter("ready"sv);
+    ::close(s_starter_fd);
+    s_starter_fd = -1;
+}
+
+// Two servers that start on one path at once take turns to look for a server there and to bind, so that neither removes
+// the socket that the other has just bound. The lock is on a file next to the socket, which its holder removes when it is
+// done. Whoever gets the lock on a file that was removed in the meantime tries again.
+static ErrorOr<int> lock_socket_path(ByteString const& lock_path)
+{
+    auto deadline = MonotonicTime::now() + socket_lock_timeout;
+    for (;;) {
+        auto fd_or_error = Core::System::open(lock_path, O_RDONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd_or_error.is_error())
+            return report_error(ByteString::formatted("Unable to open the lock file {}", lock_path), fd_or_error.release_error());
+        auto fd = fd_or_error.release_value();
+        if (::flock(fd, LOCK_EX | LOCK_NB) < 0) {
+            auto flock_errno = errno;
+            ::close(fd);
+            if (flock_errno != EWOULDBLOCK && flock_errno != EINTR)
+                return Error::from_syscall("flock"sv, flock_errno);
+            if (MonotonicTime::now() >= deadline)
+                return Error::from_string_literal("Another server is still starting on the Emacs socket path");
+            TRY(Core::System::sleep_ms(20));
+            continue;
+        }
+
+        auto locked = Core::System::fstat(fd);
+        auto current = Core::System::lstat(lock_path);
+        if (!locked.is_error() && !current.is_error() && locked.value().st_dev == current.value().st_dev && locked.value().st_ino == current.value().st_ino)
+            return fd;
+        ::close(fd);
+    }
+}
+
+ErrorOr<NonnullOwnPtr<EmacsTransport>> EmacsTransport::create(Kind kind)
 {
     auto transport = adopt_own(*new EmacsTransport(kind));
 
     if (kind == Kind::Socket) {
-        if (!socket_path.has_value())
-            return Error::from_string_literal("The socket transport needs a socket path");
-        TRY(transport->listen(*socket_path));
+        if (s_listen_fd < 0)
+            return Error::from_string_literal("The socket must be listened on before the Emacs transport is created");
+        transport->m_listen_fd = exchange(s_listen_fd, -1);
+        transport->m_socket_path = move(*s_socket_path);
+        transport->m_socket_device = s_socket_device;
+        transport->m_socket_inode = s_socket_inode;
+        transport->m_listen_notifier = Core::Notifier::construct(transport->m_listen_fd, Core::Notifier::Type::Read);
+        transport->m_listen_notifier->on_activation = [self = transport.ptr()] {
+            self->accept_connections();
+        };
         return transport;
     }
 
@@ -174,16 +508,21 @@ void EmacsTransport::Connection::close()
 
 ErrorOr<void> EmacsTransport::listen(ByteString const& socket_path)
 {
+    TRY(validate_socket_path(socket_path));
     sockaddr_un address {};
     address.sun_family = AF_LOCAL;
-    if (socket_path.length() >= sizeof(address.sun_path))
-        return Error::from_string_literal("The Emacs socket path is too long for a Unix socket");
     socket_path.bytes().copy_to({ address.sun_path, sizeof(address.sun_path) });
 
+    auto lock_path = ByteString::formatted("{}.lock", socket_path);
+    auto lock_fd = TRY(lock_socket_path(lock_path));
+    ScopeGuard unlock = [&] {
+        (void)::unlink(lock_path.characters());
+        ::close(lock_fd);
+    };
+
     // Only a socket that no server answers on makes way for this one.
-    struct stat existing {};
-    if (::lstat(socket_path.characters(), &existing) == 0) {
-        if (!S_ISSOCK(existing.st_mode))
+    if (auto existing = Core::System::lstat(socket_path); !existing.is_error()) {
+        if (!S_ISSOCK(existing.value().st_mode))
             return Error::from_string_literal("The Emacs socket path exists and is not a socket");
 
         auto probe_fd = TRY(Core::System::socket(AF_LOCAL, SOCK_STREAM, 0));
@@ -195,29 +534,153 @@ ErrorOr<void> EmacsTransport::listen(ByteString const& socket_path)
         if (connect_errno != ECONNREFUSED)
             return Error::from_syscall("connect"sv, connect_errno);
         TRY(Core::System::unlink(socket_path));
-    } else if (errno != ENOENT) {
-        return Error::from_syscall("lstat"sv, errno);
+    } else if (existing.error().code() != ENOENT) {
+        return existing.release_error();
     }
 
-    m_listen_fd = TRY(Core::System::socket(AF_LOCAL, SOCK_STREAM, 0));
-    TRY(set_nonblocking_and_close_on_exec(m_listen_fd));
-    TRY(Core::System::bind(m_listen_fd, reinterpret_cast<sockaddr const*>(&address), sizeof(address)));
+    auto listen_fd = TRY(Core::System::socket(AF_LOCAL, SOCK_STREAM, 0));
+    ArmedScopeGuard close_listen_fd = [&] { ::close(listen_fd); };
+    TRY(set_nonblocking_and_close_on_exec(listen_fd));
+    if (auto bound = Core::System::bind(listen_fd, reinterpret_cast<sockaddr const*>(&address), sizeof(address)); bound.is_error())
+        return report_error(ByteString::formatted("Unable to bind the socket {}", socket_path), bound.release_error());
+    ArmedScopeGuard remove_socket = [&] { (void)::unlink(socket_path.characters()); };
 
     // The socket is this server's to remove for as long as the path names the one bound here.
-    struct stat bound {};
-    if (::lstat(socket_path.characters(), &bound) < 0)
-        return Error::from_syscall("lstat"sv, errno);
-    m_socket_path = socket_path;
-    m_socket_device = bound.st_dev;
-    m_socket_inode = bound.st_ino;
-
+    auto bound = TRY(Core::System::lstat(socket_path));
     TRY(Core::System::chmod(socket_path, 0600));
-    TRY(Core::System::listen(m_listen_fd, listen_backlog));
+    TRY(Core::System::listen(listen_fd, listen_backlog));
 
-    m_listen_notifier = Core::Notifier::construct(m_listen_fd, Core::Notifier::Type::Read);
-    m_listen_notifier->on_activation = [this] {
-        accept_connections();
-    };
+    close_listen_fd.disarm();
+    remove_socket.disarm();
+    s_listen_fd = listen_fd;
+    *s_socket_path = socket_path;
+    s_socket_device = bound.st_dev;
+    s_socket_inode = bound.st_ino;
+    return {};
+}
+
+// The descriptor of the first socket that systemd hands to a process, SD_LISTEN_FDS_START.
+static constexpr int systemd_first_socket_fd = 3;
+#if defined(AK_OS_MACOS)
+// The key of the socket in the Sockets dictionary of the launchd job.
+static constexpr char const* launchd_socket_name = "Listeners";
+#endif
+
+static ErrorOr<int> take_systemd_socket(StringView listen_pid, StringView listen_fds)
+{
+    if (listen_pid.to_number<pid_t>() != getpid())
+        return Error::from_string_literal("LISTEN_PID does not name this process");
+    if (listen_fds != "1"sv)
+        return Error::from_string_literal("LISTEN_FDS does not count exactly one socket");
+    return systemd_first_socket_fd;
+}
+
+#if defined(AK_OS_MACOS)
+static ErrorOr<int> take_launchd_socket()
+{
+    int* fds = nullptr;
+    size_t count = 0;
+    auto result = launch_activate_socket(launchd_socket_name, &fds, &count);
+    if (result == ESRCH)
+        return Error::from_string_literal("Neither LISTEN_FDS nor a launchd job hands this process a socket");
+    if (result == ENOENT)
+        return Error::from_string_literal("The launchd job of this process has no socket named Listeners");
+    if (result != 0)
+        return Error::from_errno(result);
+
+    ScopeGuard free_fds = [&] { free(fds); };
+    if (count == 1)
+        return fds[0];
+    for (size_t i = 0; i < count; ++i)
+        ::close(fds[i]);
+    return Error::from_string_literal("The socket named Listeners in the launchd job is not exactly one socket");
+}
+#endif
+
+// A socket that systemd or launchd made listens already. Where the system cannot be asked whether a socket listens, as
+// on macOS, one that is not connected is made to listen, which fails for one that is not bound.
+static ErrorOr<void> check_activated_socket(int fd)
+{
+    auto status = TRY(Core::System::fstat(fd));
+    if (!S_ISSOCK(status.st_mode))
+        return Error::from_string_literal("It is not a socket");
+
+    int type = 0;
+    socklen_t type_size = sizeof(type);
+    TRY(Core::System::getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_size));
+    if (type != SOCK_STREAM)
+        return Error::from_string_literal("It is not a stream socket");
+
+    sockaddr_un address {};
+    socklen_t address_size = sizeof(address);
+    TRY(Core::System::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &address_size));
+    if (address.sun_family != AF_LOCAL)
+        return Error::from_string_literal("It is not a Unix socket");
+
+    int listening = 0;
+    socklen_t listening_size = sizeof(listening);
+    auto asked = Core::System::getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &listening, &listening_size);
+    if (!asked.is_error()) {
+        if (listening == 0)
+            return Error::from_string_literal("It does not listen");
+        return {};
+    }
+    if (asked.error().code() != ENOPROTOOPT)
+        return asked.release_error();
+
+    sockaddr_un peer {};
+    socklen_t peer_size = sizeof(peer);
+    // NB: A socket whose connection has ended fails with EINVAL.
+    auto connected = Core::System::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &peer_size);
+    if (!connected.is_error() || connected.error().code() == EINVAL)
+        return Error::from_string_literal("It is or was connected");
+    if (connected.error().code() != ENOTCONN)
+        return connected.release_error();
+    if (auto listened = Core::System::listen(fd, listen_backlog); listened.is_error()) {
+        if (listened.error().code() == EINVAL)
+            return Error::from_string_literal("It is not bound to an address and cannot listen");
+        return listened.release_error();
+    }
+    return {};
+}
+
+ErrorOr<void> EmacsTransport::take_activated_socket()
+{
+    // NB: The values point into the environment, which unsetting the variables changes.
+    auto listen_pid = Core::Environment::get("LISTEN_PID"sv).map([](auto value) { return ByteString { value }; });
+    auto listen_fds = Core::Environment::get("LISTEN_FDS"sv).map([](auto value) { return ByteString { value }; });
+    TRY(Core::Environment::unset("LISTEN_PID"sv));
+    TRY(Core::Environment::unset("LISTEN_FDS"sv));
+    TRY(Core::Environment::unset("LISTEN_FDNAMES"sv));
+    TRY(Core::Environment::unset("LISTEN_PIDFDID"sv));
+
+    auto context = "Unable to take the socket handed to the Emacs server"sv;
+    ErrorOr<int> fd_or_error = Error::from_string_literal("Neither LISTEN_PID nor LISTEN_FDS is set");
+    if (listen_pid.has_value() || listen_fds.has_value())
+        fd_or_error = take_systemd_socket(listen_pid.value_or({}), listen_fds.value_or({}));
+#if defined(AK_OS_MACOS)
+    else
+        fd_or_error = take_launchd_socket();
+#endif
+    if (fd_or_error.is_error())
+        return report_error(context, fd_or_error.release_error());
+
+    auto fd = fd_or_error.release_value();
+    if (auto checked = check_activated_socket(fd); checked.is_error()) {
+        auto error = checked.release_error();
+        if (error.is_errno() && error.code() == EBADF)
+            error = Error::from_string_literal("There is no open descriptor 3");
+        else
+            ::close(fd);
+        return report_error(context, move(error));
+    }
+    if (auto result = set_nonblocking_and_close_on_exec(fd); result.is_error()) {
+        ::close(fd);
+        return report_error(context, result.release_error());
+    }
+
+    s_listen_fd = fd;
+    *s_socket_path = {};
     return {};
 }
 

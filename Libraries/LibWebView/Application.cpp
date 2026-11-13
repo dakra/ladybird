@@ -317,6 +317,22 @@ Requests::RequestControlClient& Application::request_server_control_client()
 
 ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
 {
+    auto result = initialize_from_arguments(arguments);
+#if !defined(AK_OS_WINDOWS)
+    // A server started in the background tells the process that waits for it why it did not start.
+    if (result.is_error())
+        EmacsTransport::notify_starter(ByteString::formatted("Unable to start the Emacs server: {}", result.error()));
+#endif
+    return result;
+}
+
+ErrorOr<void> Application::initialize_from_arguments(Main::Arguments const& arguments)
+{
+    [[maybe_unused]] bool is_background_emacs_server = false;
+#if !defined(AK_OS_WINDOWS)
+    is_background_emacs_server = TRY(EmacsTransport::take_starter_fd());
+#endif
+
     TRY(handle_attached_debugger());
     if (auto result = reload_site_compatibility_data(); result.is_error())
         warnln("\033[31;1mUnable to load site compatibility data:\033[0m {}", result.error());
@@ -329,6 +345,9 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     Optional<int> window_height;
     Optional<double> device_pixel_ratio;
     Optional<StringView> emacs_socket_path;
+    bool emacs_default_socket = false;
+    bool emacs_socket_activation = false;
+    bool emacs_background = false;
     Optional<StringView> emacs_log_path;
     Optional<size_t> emacs_maximum_views;
     Optional<u32> screenshot_delay;
@@ -426,6 +445,9 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(window_height, "Set viewport height in pixels (default: 600) (currently only supported for headless mode)", "window-height", 0, "pixels");
     args_parser.add_option(device_pixel_ratio, "Set the device pixel ratio (default: 1) (only supported for headless terminal mode)", "device-pixel-ratio", 0, "ratio");
     args_parser.add_option(emacs_socket_path, "Serve the Emacs client on a Unix socket instead of stdio (only supported for headless emacs mode)", "emacs-socket", 0, "path");
+    args_parser.add_option(emacs_default_socket, "Serve the Emacs client on the Unix socket $XDG_RUNTIME_DIR/ladybird-emacs.sock, or without XDG_RUNTIME_DIR, ladybird-emacs-<uid>/ladybird-emacs.sock in $TMPDIR or /tmp (only supported for headless emacs mode)", "emacs-default-socket");
+    args_parser.add_option(emacs_socket_activation, "Serve the Emacs client on the listening Unix socket that systemd or launchd made for this process (only supported for headless emacs mode)", "emacs-socket-activation");
+    args_parser.add_option(emacs_background, "Serve the Emacs client in the background, and exit once its socket accepts connections (only supported for headless emacs mode)", "emacs-background");
     args_parser.add_option(emacs_log_path, "Write log output to the given file (only supported for headless emacs mode)", "emacs-log", 0, "path");
     args_parser.add_option(emacs_maximum_views, "Serve at most this many views at a time, from 1 to 64 (default: 16) (only supported for headless emacs mode)", "emacs-max-views", 0, "count");
     args_parser.add_option(certificates, "Path to a certificate file", "certificate", 'C', "certificate");
@@ -629,6 +651,32 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         m_browser_options.device_pixel_ratio = *device_pixel_ratio;
     if (emacs_socket_path.has_value())
         m_browser_options.emacs_socket_path = *emacs_socket_path;
+#if !defined(AK_OS_WINDOWS)
+    if (emacs_socket_activation) {
+        if (headless_mode != HeadlessMode::Emacs)
+            return Error::from_string_literal("--emacs-socket-activation needs --headless=emacs");
+        if (emacs_socket_path.has_value() || emacs_default_socket)
+            return Error::from_string_literal("--emacs-socket-activation cannot be given with --emacs-socket or --emacs-default-socket");
+        if (emacs_background)
+            return Error::from_string_literal("--emacs-socket-activation and --emacs-background cannot be given together");
+        m_browser_options.emacs_socket_activation = true;
+    }
+    if (emacs_default_socket) {
+        if (emacs_socket_path.has_value())
+            return Error::from_string_literal("--emacs-socket and --emacs-default-socket cannot be given together");
+        if (headless_mode != HeadlessMode::Emacs)
+            return Error::from_string_literal("--emacs-default-socket needs --headless=emacs");
+        m_browser_options.emacs_socket_path = TRY(EmacsTransport::default_socket_path());
+    }
+    if (m_browser_options.emacs_socket_path.has_value())
+        TRY(EmacsTransport::validate_socket_path(*m_browser_options.emacs_socket_path));
+    if (emacs_background && headless_mode != HeadlessMode::Emacs)
+        return Error::from_string_literal("--emacs-background needs --headless=emacs");
+    if (emacs_background && !m_browser_options.emacs_socket_path.has_value())
+        return Error::from_string_literal("--emacs-background needs --emacs-socket or --emacs-default-socket");
+    if (is_background_emacs_server && !emacs_background)
+        return Error::from_string_literal("The pipe to a starting process is only for a server started with --emacs-background");
+#endif
     if (emacs_log_path.has_value())
         m_browser_options.emacs_log_path = *emacs_log_path;
     if (emacs_maximum_views.has_value()) {
@@ -642,8 +690,15 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
 #if !defined(AK_OS_WINDOWS)
     if (headless_mode == HeadlessMode::Terminal)
         TRY(TerminalWebView::take_over_terminal());
-    if (headless_mode == HeadlessMode::Emacs)
-        TRY(EmacsTransport::take_over_stdio(m_browser_options.emacs_socket_path.has_value() ? EmacsTransport::Kind::Socket : EmacsTransport::Kind::Stdio, m_browser_options.emacs_log_path));
+    if (headless_mode == HeadlessMode::Emacs) {
+        // The server that runs in the background is started from here, and this process only waits for it.
+        if (emacs_background && !is_background_emacs_server) {
+            m_background_start_exit_status = TRY(EmacsTransport::start_in_background(arguments.strings));
+            return {};
+        }
+        auto kind = m_browser_options.emacs_socket_path.has_value() || m_browser_options.emacs_socket_activation ? EmacsTransport::Kind::Socket : EmacsTransport::Kind::Stdio;
+        TRY(EmacsTransport::take_over_stdio(kind, m_browser_options.emacs_socket_path, m_browser_options.emacs_log_path));
+    }
 #endif
 
     if (webdriver_browser_endpoint.has_value())
@@ -2596,7 +2651,12 @@ ErrorOr<int> Application::execute()
 #if !defined(AK_OS_WINDOWS)
         // The Emacs client creates the view, so the server also runs without a URL.
         if (*m_browser_options.headless_mode == HeadlessMode::Emacs) {
-            auto emacs_server = TRY(EmacsServer::create(move(theme), m_browser_options));
+            auto emacs_server = EmacsServer::create(move(theme), m_browser_options);
+            if (emacs_server.is_error()) {
+                EmacsTransport::notify_starter(ByteString::formatted("Unable to start the Emacs server: {}", emacs_server.error()));
+                return emacs_server.release_error();
+            }
+            EmacsTransport::notify_starter({});
             return m_event_loop->exec();
         }
 

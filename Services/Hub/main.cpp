@@ -112,6 +112,8 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         warnln("Ladybird is already running with this profile, but it is not responding");
         return WebView::BrowserProcess::unresponsive_browser_exit_status;
     }
+    if (auto exit_status = application->background_start_exit_status(); exit_status.has_value())
+        return *exit_status;
     if (application->should_exit_after_profile_coordination()) {
         outln("Opening in existing process");
         return 0;

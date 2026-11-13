@@ -103,6 +103,8 @@ public:
     // Whether the process exits because a browser is running for the profile, but does not take what we were asked to
     // open.
     bool browser_is_unresponsive() const { return m_browser_is_unresponsive; }
+    // Set once this process has started a server in the background, which it does instead of being one.
+    Optional<int> background_start_exit_status() const { return m_background_start_exit_status; }
 
     static BrowserOptions const& browser_options() { return the().m_browser_options; }
     static RequestServerOptions const& request_server_options() { return the().m_request_server_options; }
@@ -441,6 +443,7 @@ protected:
     explicit Application(Optional<ByteString> ladybird_binary_path = {});
 
     ErrorOr<void> initialize(Main::Arguments const&);
+    ErrorOr<void> initialize_from_arguments(Main::Arguments const&);
 
     virtual void process_did_exit(Process&&, Optional<int> exit_status);
 
@@ -624,6 +627,7 @@ private:
     OwnPtr<BrowserProcess> m_browser_process;
     bool m_should_exit_after_profile_coordination { false };
     bool m_browser_is_unresponsive { false };
+    Optional<int> m_background_start_exit_status;
     OwnPtr<ApplicationSettingsObserver> m_settings_observer;
     OwnPtr<ApplicationPermissionManagerObserver> m_permission_manager_observer;
     RefPtr<Core::Timer> m_permission_expiry_timer;

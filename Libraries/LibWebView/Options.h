@@ -100,6 +100,7 @@ struct BrowserOptions {
     int window_height { 600 };
     double device_pixel_ratio { 1.0 };
     Optional<ByteString> emacs_socket_path {};
+    bool emacs_socket_activation { false };
     Optional<ByteString> emacs_log_path {};
     Optional<size_t> emacs_maximum_views {};
     NewWindow new_window { NewWindow::No };

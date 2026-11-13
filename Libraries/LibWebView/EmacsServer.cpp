@@ -36,8 +36,8 @@ static JsonValue echoed(JsonObject const& object, StringView key)
 
 ErrorOr<NonnullOwnPtr<EmacsServer>> EmacsServer::create(Core::AnonymousBuffer theme, BrowserOptions const& options)
 {
-    auto kind = options.emacs_socket_path.has_value() ? EmacsTransport::Kind::Socket : EmacsTransport::Kind::Stdio;
-    auto transport = TRY(EmacsTransport::create(kind, options.emacs_socket_path));
+    auto kind = options.emacs_socket_path.has_value() || options.emacs_socket_activation ? EmacsTransport::Kind::Socket : EmacsTransport::Kind::Stdio;
+    auto transport = TRY(EmacsTransport::create(kind));
     auto maximum_views = options.emacs_maximum_views.value_or(default_maximum_views);
     VERIFY(maximum_views >= 1 && maximum_views <= maximum_maximum_views);
     auto server = adopt_own(*new EmacsServer(move(theme), move(transport), maximum_views));

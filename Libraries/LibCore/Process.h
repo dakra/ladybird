@@ -49,6 +49,9 @@ struct ProcessSpawnOptions {
     // such as SIGINT for Ctrl+C, do not reach it. SIGTTOU starts out blocked, so that writing to a terminal with tostop
     // set does not stop it. On Windows, the new process group only keeps Ctrl+C from it.
     bool new_process_group { false };
+    // Start this process in a session of its own, without a controlling terminal, so that the hangup of a terminal or the
+    // signals sent to the process group of whoever started it do not reach it. Not combined with new_process_group.
+    bool new_session { false };
     ReadonlySpan<ByteString> arguments {};
     // The child's whole environment, as NAME=value strings. Without it, the child inherits the environment of this
     // process.

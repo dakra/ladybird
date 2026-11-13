@@ -42,11 +42,37 @@ public:
     };
 
     // Keeps the standard streams for the client, and sends what this process and every helper it starts would print
-    // there to a log file instead. Must run before any helper process is started.
-    static ErrorOr<void> take_over_stdio(Kind, Optional<ByteString> const& log_path);
+    // there to a log file instead. On a socket, it first listens there, or without a socket path takes the socket that
+    // take_activated_socket() describes, so that a server that cannot have the socket leaves the log alone. Must run
+    // before any helper process is started. Without a log path the log is
+    // ladybird-emacs-<pid>.log in the directory of the default socket when default_socket_path() gave the socket path,
+    // else in $XDG_RUNTIME_DIR, and where there is neither or that cannot be opened, /tmp/ladybird-emacs-<pid>-XXXXXX.log
+    // with XXXXXX chosen at random. A log that cannot be opened is named on stderr and to a waiting starter.
+    static ErrorOr<void> take_over_stdio(Kind, Optional<ByteString> const& socket_path, Optional<ByteString> const& log_path);
     static ByteString const& log_path();
 
-    static ErrorOr<NonnullOwnPtr<EmacsTransport>> create(Kind, Optional<ByteString> const& socket_path);
+    // $XDG_RUNTIME_DIR/ladybird-emacs.sock, or where that variable is unset, empty or relative, ladybird-emacs.sock in
+    // the directory ladybird-emacs-<uid> of $TMPDIR, or of /tmp where that is unset, empty or relative, with <uid> the
+    // real user ID. That directory is made with mode 0700 when it is missing. It fails, naming the path on stderr and
+    // to a waiting starter, when the socket path does not fit, or when the directory is a symbolic link, not a
+    // directory, not the user's, or open to its group or others, or its parent belongs to another user than root or the
+    // user, or its group or others can write to the parent and it is not sticky.
+    static ErrorOr<ByteString> default_socket_path();
+    // Fails for a path that does not fit the address of a Unix socket.
+    static ErrorOr<void> validate_socket_path(StringView);
+
+    // Runs this program again with the given arguments in a session of its own, with its standard streams on /dev/null,
+    // and waits up to a minute until it accepts connections on its socket or fails to start. Says on stderr where it
+    // logs to, or why it did not start, and returns the status for this process to exit with.
+    static ErrorOr<int> start_in_background(ReadonlySpan<StringView> arguments);
+    // The variable through which start_in_background() names the pipe to the process waiting for the server.
+    static constexpr StringView starter_fd_variable = "LADYBIRD_EMACS_STARTER_FD"sv;
+    // Takes the pipe out of the environment, so that no helper process sees it. Says whether there was one.
+    static ErrorOr<bool> take_starter_fd();
+    // Tells the waiting process, if there is one, that the server accepts connections, or why it does not.
+    static void notify_starter(Optional<ByteString> const& failure);
+
+    static ErrorOr<NonnullOwnPtr<EmacsTransport>> create(Kind);
     ~EmacsTransport();
 
     // Says why a hello is not acceptable, or nothing for one that is.
@@ -105,7 +131,13 @@ private:
 
     explicit EmacsTransport(Kind);
 
-    ErrorOr<void> listen(ByteString const& socket_path);
+    static ErrorOr<void> listen(ByteString const& socket_path);
+    // Takes the listening socket that systemd or launchd made for this process: with LISTEN_PID naming this process,
+    // the one socket that LISTEN_FDS counts, as descriptor 3, else on macOS the socket named Listeners in the launchd job.
+    // LISTEN_PID, LISTEN_FDS, LISTEN_FDNAMES and LISTEN_PIDFDID are taken out of the environment. It fails for anything
+    // but a Unix stream socket that is bound and listens, and the socket file, which belongs to whoever made the socket,
+    // is left alone.
+    static ErrorOr<void> take_activated_socket();
     void accept_connections();
     ErrorOr<void> add_connection(int in_fd, int out_fd);
 
