@@ -50,6 +50,9 @@ public:
     // with XXXXXX chosen at random. A log that cannot be opened is named on stderr and to a waiting starter.
     static ErrorOr<void> take_over_stdio(Kind, Optional<ByteString> const& socket_path, Optional<ByteString> const& log_path);
     static ByteString const& log_path();
+    // A directory that only the user can write to, for the files the server makes: that of the default socket when
+    // default_socket_path() gave the socket path, else $XDG_RUNTIME_DIR. Nothing where there is neither.
+    static Optional<ByteString> private_directory();
 
     // $XDG_RUNTIME_DIR/ladybird-emacs.sock, or where that variable is unset, empty or relative, ladybird-emacs.sock in
     // the directory ladybird-emacs-<uid> of $TMPDIR, or of /tmp where that is unset, empty or relative, with <uid> the

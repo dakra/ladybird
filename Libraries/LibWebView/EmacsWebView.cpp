@@ -31,6 +31,7 @@
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/EmacsProtocol.h>
 #include <LibWebView/EmacsServer.h>
+#include <LibWebView/EmacsTransport.h>
 #include <LibWebView/EmacsWebView.h>
 #include <LibWebView/PageBackingStores.h>
 #include <LibWebView/URL.h>
@@ -41,6 +42,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -148,19 +150,34 @@ static JsonValue echoed(JsonObject const& object, StringView key)
 
 // Writes a file that only this user reads. Without a path, the file gets a name in /tmp, where anyone can put a file or
 // a link at a name, so that one is a file this process creates.
-static ErrorOr<ByteString> write_private_file(Optional<ByteString> const& path, StringView default_name, ReadonlyBytes contents)
+// Without a path the file is <name><suffix> in EmacsTransport::private_directory(), or where there is none or it cannot
+// be made there, /tmp/<name>-XXXXXX<suffix> with XXXXXX chosen at random: anyone can put a file or a link at a name
+// in /tmp.
+static ErrorOr<ByteString> write_private_file(Optional<ByteString> const& path, StringView default_name, StringView suffix, ReadonlyBytes contents)
 {
     auto fd = -1;
     auto written_path = path.value_or({});
     if (path.has_value()) {
         fd = ::open(path->characters(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (fd < 0)
+            return Error::from_syscall("open"sv, errno);
     } else {
-        written_path = ByteString::formatted("/tmp/{}", default_name);
-        (void)::unlink(written_path.characters());
-        fd = ::open(written_path.characters(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (auto directory = EmacsTransport::private_directory(); directory.has_value()) {
+            written_path = ByteString::formatted("{}/{}{}", *directory, default_name, suffix);
+            (void)::unlink(written_path.characters());
+            fd = ::open(written_path.characters(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        }
+        if (fd < 0) {
+            auto pattern = ByteString::formatted("/tmp/{}-XXXXXX{}", default_name, suffix);
+            Vector<char> name;
+            name.append(pattern.characters(), pattern.length() + 1);
+            fd = ::mkstemps(name.data(), static_cast<int>(suffix.length()));
+            if (fd < 0)
+                return Error::from_syscall("mkstemps"sv, errno);
+            written_path = name.data();
+            (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
+        }
     }
-    if (fd < 0)
-        return Error::from_syscall("open"sv, errno);
 
     auto file = TRY(Core::File::adopt_fd(fd, Core::File::OpenMode::Write));
     TRY(file->write_until_depleted(contents));
@@ -1368,8 +1385,8 @@ void EmacsWebView::save_screenshot(PendingScreenshot const& screenshot, Gfx::Bit
         auto png = TRY(Gfx::PNGWriter::encode(bitmap));
         ByteString default_name;
         if (!screenshot.path.has_value())
-            default_name = ByteString::formatted("ladybird-emacs-{}-screenshot-{}.png", getpid(), m_server.next_screenshot_number());
-        return write_private_file(screenshot.path, default_name, png);
+            default_name = ByteString::formatted("ladybird-emacs-{}-screenshot-{}", getpid(), m_server.next_screenshot_number());
+        return write_private_file(screenshot.path, default_name, ".png"sv, png);
     };
 
     auto saved_path = save();

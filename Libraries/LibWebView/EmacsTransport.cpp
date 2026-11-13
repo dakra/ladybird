@@ -170,11 +170,17 @@ static ErrorOr<int> open_temporary_log()
     return fd;
 }
 
-// The default log is in a directory that only the user can write to where there is one: that of the default socket
-// when the server listens there, else $XDG_RUNTIME_DIR. Where it cannot be opened there, it is in /tmp.
+Optional<ByteString> EmacsTransport::private_directory()
+{
+    if (s_default_socket_directory->has_value())
+        return *s_default_socket_directory;
+    return runtime_directory();
+}
+
+// The default log is in private_directory() where there is one. Where it cannot be opened there, it is in /tmp.
 static ErrorOr<int> open_default_log()
 {
-    auto directory = s_default_socket_directory->has_value() ? *s_default_socket_directory : runtime_directory();
+    auto directory = EmacsTransport::private_directory();
     if (!directory.has_value())
         return open_temporary_log();
 
